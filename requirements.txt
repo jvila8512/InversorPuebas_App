@@ -1,0 +1,6 @@
+# Requirements for InversorMonitor App
+PyQt5==5.15.11
+pyqtgraph==0.14.0
+pyserial==3.5
+fastapi==0.115.0
+uvicorn==0.32.0

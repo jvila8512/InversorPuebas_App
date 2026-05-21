@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+    <title>InverterMon</title>
+    <base href="/"/>
+    <link href="css/bootstrap/bootstrap.min.css" rel="stylesheet"/>
+    <link href="css/app.css" rel="stylesheet"/>
+    <link href="InverterMon.Client.styles.css" rel="stylesheet"/>
+    <link href="manifest.json" rel="manifest"/>
+    <link rel="apple-touch-icon" sizes="512x512" href="icon-512.png"/>
+    <link rel="apple-touch-icon" sizes="192x192" href="icon-192.png"/>
+    <script src="bootstrap.bundle.min.js"></script>
+    <script src="https://unpkg.com/@antv/g2plot@1.1.28/dist/g2plot.js"></script>
+    <script src="_content/AntDesign.Charts/ant-design-charts-blazor.js"></script>
+</head>
+
+<body>
+<div id="app">
+    <div class="container w-100 text-center">
+        <div class="my-auto p-5 loader">
+            <span class="spinner-border"></span>
+            <div class="fw-bold">... Loading ...</div>
+        </div>
+    </div>
+</div>
+
+<script src="_framework/blazor.webassembly.js"></script>
+<script>
+    let lastVisibleTime = Date.now();
+    document.addEventListener("visibilitychange", function () {
+        if (document.hidden) {
+            lastVisibleTime = Date.now();
+        } else {
+            if (Date.now() - lastVisibleTime > 180000) {
+                location.reload();
+            }
+        }
+    });
+</script>
+<script>
+    if ('serviceWorker' in navigator) {
+        window.addEventListener('load', function () {
+            navigator.serviceWorker.register('service-worker.js');
+        });
+    }
+</script>
+</body>
+
+</html>

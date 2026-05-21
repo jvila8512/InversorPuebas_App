@@ -1,0 +1,254 @@
+﻿@page "/bms"
+@using InverterMon.Client.AppState
+@using InverterMon.Shared.Models
+@using System.Text.Json
+@implements IDisposable
+@inject IJSRuntime Js
+
+<PageTitle>JK BMS Status</PageTitle>
+
+<Loader Enabled=@(status is null)/>
+
+@if (status is not null)
+{
+    <div class="card mt-2">
+        <h5 class="card-header fw-bold">
+            <span class="oi oi-battery-empty" aria-hidden="true"></span>
+            JK BMS
+        </h5>
+        <div class="card-body p-0">
+            <div class="container m-0 p-0 jkbms">
+                <div class="row text-center m-0 p-0">
+                    <div class="col">
+                        <div class="fw-bold fs-1 mt-2 text-primary">
+                            @($"{status.PackVoltage:0.0}") V
+                        </div>
+                        <div class="fs-1 my-1 mx-5 border-top">
+                            @status.CapacityPct%
+                        </div>
+                        <div class="fs-5 pack-capacity m-0" style="cursor: pointer; background-color: #505e8b42;" @onclick="ToggleCapacityKwh">
+                            @(GetPackCapacity())
+                        </div>
+                    </div>
+                    <div class="col bg-light">
+                        <div class="p-0 mt-2 fw-bold">
+                            <div class="fs-1">
+                                @($"{status.AvgCurrentAmps:0.0} A")
+                            </div>
+                            @if (status.AvgCurrentAmps > 0)
+                            {
+                                <div class="fs-5 m-0 p-0 @(status.IsCharging ? "text-success" : "text-danger")">
+                                    @(status.IsCharging ? "Charging" : "Discharging")
+                                </div>
+                                <div class="fw-bold fs-6 text-secondary">
+                                    @($"{status.CRate:0.00} C") / @($"{status.AvgPowerWatts:0} W")
+                                </div>
+                                <div class="fw-normal fs-6 m-0 p-0" style="cursor: pointer;" @onclick="ToggleEndDateAndTime">
+                                    @(GetTimeLeft())
+                                </div>
+                            }
+                            @if (status.AvgCurrentAmps == 0)
+                            {
+                                <div class="fs-5 m-0 p-0 text-muted">
+                                    Holding<br/>Voltage
+                                </div>
+                            }
+                            @if (status.IsWarning)
+                            {
+                                <div class="fs-5 fw-bold m-0 p-0 text-danger blinktext">
+                                    Protection!
+                                </div>
+                            }
+                        </div>
+                    </div>
+                </div>
+                <div class="row text-center m-1 p-1 fw-bold" style="font-size:0.8em; background-color:#0000003b;">
+                    <div class="col">
+                        <div class="fw-normal">
+                            Mosfet
+                        </div>
+                        @status.MosTemp C°
+                    </div>
+                    <div class="col">
+                        <div class="fw-normal">
+                            Probe 1
+                        </div>
+                        @status.Temp1 C°
+                    </div>
+                    <div class="col">
+                        <div class="fw-normal">
+                            Probe 2
+                        </div>
+                        @status.Temp2 C°
+                    </div>
+                </div>
+                <div class="row text-center m-1 p-0 fs-6">
+                    <div class="col bg-light p-1" style="font-size:0.8em">
+                        <div class="pt-1">
+                            Min Cell: @status.MinCell.Key
+                        </div>
+                        <div class="fw-bold">
+                            @($"{status.MinCell.Value:0.000} V")
+                        </div>
+                        <div class="pt-1">
+                            Max Cell: <span>@status.MaxCell.Key</span>
+                        </div>
+                        <div class="fw-bold">
+                            @($"{status.MaxCell.Value:0.000} V")
+                        </div>
+                    </div>
+                    <div class="col bg-light p-1" style="font-size:0.8em;margin-left:0.25rem!important">
+                        <div class="pt-1">
+                            Cell Delta:
+                        </div>
+                        <div class="fw-bold">
+                            @($"{status.CellDiff:0.000} V")
+                        </div>
+                        <div class="pt-1">
+                            Cell Average:
+                        </div>
+                        <div class="fw-bold">
+                            @($"{status.AvgCellVoltage:0.000} V")
+                        </div>
+                    </div>
+                </div>
+                <div class="row text-center m-1 p-0" style="font-size:0.75em">
+                    @foreach (var cell in status.Cells)
+                    {
+                        <div class="col-3 p-1">
+                            <strong class="bg-light border rounded-3 p-1">@($"{cell.Key:00}")</strong> @($"{cell.Value:0.000} V")
+                        </div>
+                    }
+                </div>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    private static event Action<BMSStatus?>? onStatusUpdated;
+    private static event Action? onStatusRetrievalError;
+    private static BMSStatus? status;
+    private static ClientSettings state = new();
+
+    protected override void OnInitialized()
+    {
+        onStatusUpdated += UpdateState;
+        onStatusRetrievalError += NullifyStatus;
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        var st = await Js.LoadStateAsync<ClientSettings>();
+
+        if (st is null)
+        {
+            await Js.SaveStateAsync(state);
+        }
+        else
+        {
+            state = st;
+        }
+    }
+
+    private void NullifyStatus()
+    {
+        status = null;
+        StateHasChanged();
+    }
+
+    private void UpdateState(BMSStatus? s)
+    {
+        status = s;
+        StateHasChanged();
+    }
+
+    private string GetTimeLeft()
+    {
+        if (state.ShowEndDateAndTime)
+        {
+            return status!.GetTimeString();
+        }
+
+        return $"{status!.TimeHrs} Hrs {status.TimeMins} Mins";
+    }
+
+    private string GetPackCapacity()
+    {
+        if (state.ShowCapacityKwh)
+        {
+            var avlCap = Math.Round(status!.AvailableCapacity * status.PackNominalVoltage / 1000, 1);
+            var packCap = Math.Round(status!.PackCapacity * status.PackNominalVoltage / 1000, 1);
+
+            return $"{avlCap} kWh / {packCap} kWh";
+        }
+
+        return $"{Math.Round(status!.AvailableCapacity, 1)} Ah / {status!.PackCapacity} Ah";
+    }
+
+    private async Task ToggleCapacityKwh()
+    {
+        state.ShowCapacityKwh = !state.ShowCapacityKwh;
+        await Js.SaveStateAsync(state);
+    }
+
+    private async Task ToggleEndDateAndTime()
+    {
+        state.ShowEndDateAndTime = !state.ShowEndDateAndTime;
+        await Js.SaveStateAsync(state);
+    }
+
+    public void Dispose()
+    {
+        onStatusUpdated -= UpdateState;
+        onStatusRetrievalError -= NullifyStatus;
+    }
+
+    public static async Task StartStatusStreaming(string basePath)
+    {
+        //note: only reason we have a full-time stream download is because there's a bug in
+        //      blazor-wasm that doesn't close the fetch http requests when streaming is involved.
+        //      and it leads to a new stream download being created everytime a page is initialized.
+        //      which leads to a memory leak/ connection exhaustion.
+
+        using var client = new HttpClient();
+        client.BaseAddress = new(basePath);
+        client.Timeout = TimeSpan.FromSeconds(5);
+
+        var retryDelay = 1000;
+
+        while (true)
+        {
+            try
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Get, "api/bms-status");
+                request.SetBrowserResponseStreamingEnabled(true);
+
+                using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+                response.EnsureSuccessStatusCode();
+
+                using var stream = await response.Content.ReadAsStreamAsync();
+
+                await foreach (var s in
+                               JsonSerializer.DeserializeAsyncEnumerable<BMSStatus>(
+                                   stream,
+                                   new JsonSerializerOptions
+                                   {
+                                       PropertyNameCaseInsensitive = true,
+                                       DefaultBufferSize = 64
+                                   }))
+                {
+                    onStatusUpdated?.Invoke(s);
+                    retryDelay = 1000;
+                }
+            }
+            catch (Exception)
+            {
+                onStatusRetrievalError?.Invoke();
+                await Task.Delay(retryDelay);
+                retryDelay += 500;
+            }
+        }
+    }
+
+}

@@ -1,0 +1,453 @@
+﻿@page "/settings"
+@using InverterMon.Shared.Models
+@inject HttpClient Http
+
+<PageTitle>Settings</PageTitle>
+
+<Loader Enabled=@(settings is null)/>
+
+@if (settings is not null)
+{
+    <ul class="nav nav-tabs" id="myTab" role="tablist">
+        <li class="nav-item" role="presentation">
+            <button class="nav-link active" id="settings-tab" data-bs-toggle="tab" data-bs-target="#settings" type="button" role="tab">Inverter</button>
+        </li>
+        <li class="nav-item" role="presentation">
+            <button class="nav-link" id="voltages-tab" data-bs-toggle="tab" data-bs-target="#voltages" type="button" role="tab">Voltages</button>
+        </li>
+        <li class="nav-item" role="presentation">
+            <button class="nav-link" id="spec-tab" data-bs-toggle="tab" data-bs-target="#spec" type="button" role="tab">System</button>
+        </li>
+    </ul>
+    <div class="tab-content" id="myTabContent">
+        <div class="tab-pane fade show active" id="settings" role="tabpanel">
+            <div class="row border-primary bg-light px-3">
+                <div class="col-6 my-auto fw-bold">
+                    Max Combined Charge Current (A):
+                </div>
+                <div class="col-6 p-2 bg-secondary">
+                    <input @bind-value=settings.MaxCombinedChargeCurrent class="form-control d-inline m-1" style="width:4rem;" type="text" maxlength="4">
+                    <button type="button" class="btn btn-light d-inline m-1"
+                            @onclick="()=>SetChargeCurrent(Setting.CombinedChargeCurrent,settings.MaxCombinedChargeCurrent)">
+                        <span class="@Spinner(Button.MaxCombinedChargeCurrent)"></span>
+                        <span class="@Hidden(Button.MaxCombinedChargeCurrent)">Save</span>
+                    </button>
+                </div>
+            </div>
+
+            <div class="row border-primary bg-light px-3 mt-1">
+                <div class="col-6 my-auto fw-bold">
+                    Max Grid Charge Current (A):
+                </div>
+                <div class="col-6 p-2 bg-secondary">
+                    <input @bind-value=settings.MaxACChargeCurrent class="form-control d-inline m-1" style="width:4rem;" type="text" maxlength="4">
+                    <button type="button" class="btn btn-light d-inline m-1"
+                            @onclick="()=>SetChargeCurrent(Setting.UtilityChargeCurrent,settings.MaxACChargeCurrent)">
+                        <span class="@Spinner(Button.MaxUtilityChargeCurrent)"></span>
+                        <span class="@Hidden(Button.MaxUtilityChargeCurrent)">Save</span>
+                    </button>
+                </div>
+            </div>
+
+            <div class="row border-primary bg-light px-3 mt-1">
+                <div class="col-6 my-auto fw-bold">
+                    Output Source Priority:
+                </div>
+                <div class="col-6 bg-secondary p-2">
+                    <button type="button" class="btn btn-light d-block m-2" @onclick="()=>SetOutputPriority(OutputPriority.SolarFirst)">
+                        <span class="@Spinner(Button.OpSolarFirst)"></span>
+                        <span class="@Hidden(Button.OpSolarFirst)">Solar First</span>
+                        <span class="@Success(Button.OpSolarFirst, OutputPriority.SolarFirst, settings.OutputPriority)"></span>
+                    </button>
+                    <button type="button" class="btn btn-light d-block m-2" @onclick="()=>SetOutputPriority(OutputPriority.SolarBatteryUtility)">
+                        <span class="@Spinner(Button.OpSolarBatteryUtility)"></span>
+                        <span class="@Hidden(Button.OpSolarBatteryUtility)">Solar > Battery > Utility</span>
+                        <span class="@Success(Button.OpSolarBatteryUtility, OutputPriority.SolarBatteryUtility, settings.OutputPriority)"></span>
+                    </button>
+                    <button type="button" class="btn btn-light d-block m-2" @onclick="()=>SetOutputPriority(OutputPriority.UtilityFirst)">
+                        <span class="@Spinner(Button.OpUtilityFirst)"></span>
+                        <span class="@Hidden(Button.OpUtilityFirst)">Utility First</span>
+                        <span class="@Success(Button.OpUtilityFirst, OutputPriority.UtilityFirst, settings.OutputPriority)"></span>
+                    </button>
+                </div>
+            </div>
+
+            <div class="row border-primary bg-light px-3 mt-1">
+                <div class="col-6 my-auto fw-bold">
+                    Battery Charging Priority:
+                </div>
+                <div class="col-6 bg-secondary p-2">
+                    <button type="button" class="btn btn-light d-block m-2" @onclick="()=>SetChargePriority(ChargePriority.OnlySolar)">
+                        <span class="@Spinner(Button.ChOnlySolar)"></span>
+                        <span class="@Hidden(Button.ChOnlySolar)">Solar Only</span>
+                        <span class="@Success(Button.ChOnlySolar, ChargePriority.OnlySolar, settings.ChargePriority)"></span>
+                    </button>
+                    <button type="button" class="btn btn-light d-block m-2" @onclick="()=>SetChargePriority(ChargePriority.SolarFirst)">
+                        <span class="@Spinner(Button.ChSolarFirst)"></span>
+                        <span class="@Hidden(Button.ChSolarFirst)">Solar First</span>
+                        <span class="@Success(Button.ChSolarFirst, ChargePriority.SolarFirst, settings.ChargePriority)"></span>
+                    </button>
+                    <button type="button" class="btn btn-light d-block m-2" @onclick="()=>SetChargePriority(ChargePriority.SolarAndUtility)">
+                        <span class="@Spinner(Button.ChSolarAndUtility)"></span>
+                        <span class="@Hidden(Button.ChSolarAndUtility)">Solar & Utility</span>
+                        <span class="@Success(Button.ChSolarAndUtility, ChargePriority.SolarAndUtility, settings.ChargePriority)"></span>
+                    </button>
+                    <button type="button" class="btn btn-light d-block m-2" @onclick="()=>SetChargePriority(ChargePriority.UtilityFirst)">
+                        <span class="@Spinner(Button.ChUtilityFirst)"></span>
+                        <span class="@Hidden(Button.ChUtilityFirst)">Utility First</span>
+                        <span class="@Success(Button.ChUtilityFirst, ChargePriority.UtilityFirst, settings.ChargePriority)"></span>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <div class="tab-pane fade" id="voltages" role="tabpanel">
+            <div class="row border-primary bg-light px-3 mt-0">
+                <div class="col-6 my-auto fw-bold">
+                    Bulk Charge Voltage (V):
+                </div>
+                <div class="col-6 bg-secondary p-1">
+                    <div class="row">
+                        <div>
+                            <input @bind-value=settings.BulkChargeVoltage class="form-control d-inline m-1" style="width:4rem;" type="text" maxlength="4">
+                            <button type="button" class="btn btn-light d-inline m-1" @onclick="()=>SetVoltage(Setting.BulkVoltage)">
+                                <span class="@Spinner(Button.BulkVoltage)"></span>
+                                <span class="@Hidden(Button.BulkVoltage)">Save</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="row border-primary bg-light px-3 mt-1">
+                <div class="col-6 my-auto fw-bold">
+                    Float Charge Voltage (V):
+                </div>
+                <div class="col-6 bg-secondary p-1">
+                    <div class="row">
+                        <div>
+                            <input @bind-value=settings.FloatChargeVoltage class="form-control d-inline m-1" style="width:4rem;" type="text" maxlength="4">
+                            <button type="button" class="btn btn-light d-inline m-1" @onclick="()=>SetVoltage(Setting.FloatVoltage)">
+                                <span class="@Spinner(Button.FloatVoltage)"></span>
+                                <span class="@Hidden(Button.FloatVoltage)">Save</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="row border-primary bg-light px-3 mt-1">
+                <div class="col-6 my-auto fw-bold">
+                    Discharge Cutoff Voltage (V):
+                </div>
+                <div class="col-6 bg-secondary p-1">
+                    <div class="row">
+                        <div>
+                            <input @bind-value=settings.DischargeCuttOffVoltage class="form-control d-inline m-1" style="width:4rem;" type="text"
+                                   maxlength="4">
+                            <button type="button" class="btn btn-light d-inline m-1" @onclick="()=>SetVoltage(Setting.DischargeCutOff)">
+                                <span class="@Spinner(Button.DischargeCutOff)"></span>
+                                <span class="@Hidden(Button.DischargeCutOff)">Save</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="row border-primary bg-light px-3 mt-1">
+                <div class="col-6 my-auto fw-bold">
+                    Back To Grid Voltage (V):
+                </div>
+                <div class="col-6 bg-secondary p-1">
+                    <div class="row">
+                        <div>
+                            <input @bind-value=settings.BackToGridVoltage class="form-control d-inline m-1" style="width:4rem;" type="text" maxlength="4">
+                            <button type="button" class="btn btn-light d-inline m-1" @onclick="()=>SetVoltage(Setting.BackToGrid)">
+                                <span class="@Spinner(Button.BackToGridVoltage)"></span>
+                                <span class="@Hidden(Button.BackToGridVoltage)">Save</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="row border-primary bg-light px-3 mt-1">
+                <div class="col-6 my-auto fw-bold">
+                    Back To Battery Voltage (V):
+                </div>
+                <div class="col-6 bg-secondary p-1">
+                    <div class="row">
+                        <div>
+                            <input @bind-value=settings.BackToBatteryVoltage class="form-control d-inline m-1" style="width:4rem;" type="text"
+                                   maxlength="4">
+                            <button type="button" class="btn btn-light d-inline m-1" @onclick="()=>SetVoltage(Setting.BackToBattery)">
+                                <span class="@Spinner(Button.BackToBattery)"></span>
+                                <span class="@Hidden(Button.BackToBattery)">Save</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="tab-pane fade" id="spec" role="tabpanel">
+            <div class="row border-primary bg-light px-3 mt-0">
+                <div class="col-6 my-auto fw-bold">
+                    Max PV Generation Capacity:
+                </div>
+                <div class="col-6 p-2 bg-secondary">
+                    <div class="row">
+                        <div style="width:6rem;">
+                            <input type="number" class="form-control" @bind-value=settings.SystemSpec.PV_MaxCapacity>
+                        </div>
+                        <div class="col-1 fw-bolder fs-5 m-1 text-white">W</div>
+                    </div>
+                </div>
+            </div>
+            <div class="row border-primary bg-light px-3 mt-1">
+                <div class="col-6 my-auto fw-bold">
+                    Battery Capacity:
+                </div>
+                <div class="col-6 p-2 bg-secondary">
+                    <div class="row">
+                        <div style="width:6rem;">
+                            <input type="number" class="form-control" @bind-value=settings.SystemSpec.BatteryCapacity>
+                        </div>
+                        <div class="col-1 fw-bolder fs-5 m-1 text-white">Ah</div>
+                    </div>
+                </div>
+            </div>
+            <div class="row border-primary bg-light px-3 mt-1">
+                <div class="col-6 my-auto fw-bold">
+                    Battery Voltage:
+                </div>
+                <div class="col-6 p-2 bg-secondary">
+                    <div class="row">
+                        <div style="width:6rem;">
+                            <input type="number" class="form-control" @bind-value=settings.SystemSpec.BatteryNominalVoltage>
+                        </div>
+                        <div class="col-1 fw-bolder fs-5 m-1 text-white">V</div>
+                    </div>
+                </div>
+            </div>
+            <div class="row border-primary bg-light px-3 mt-1">
+                <div class="col-6 my-auto fw-bold">
+                    Daylight Start (24hr format):
+                </div>
+                <div class="col-6 p-2 bg-secondary">
+                    <div class="row">
+                        <div style="width:6rem;">
+                            <input type="number" class="form-control" @bind-value=settings.SystemSpec.SunlightStartHour>
+                        </div>
+                        <div class="col-1 fw-bolder fs-5 m-1 text-white">Hrs</div>
+                    </div>
+                </div>
+            </div>
+            <div class="row border-primary bg-light px-3 mt-1">
+                <div class="col-6 my-auto fw-bold">
+                    Daylight End (24hr format):
+                </div>
+                <div class="col-6 p-2 bg-secondary">
+                    <div class="row">
+                        <div style="width:6rem;">
+                            <input type="number" class="form-control" @bind-value=settings.SystemSpec.SunlightEndHour>
+                        </div>
+                        <div class="col-1 fw-bolder fs-5 m-1 text-white">Hrs</div>
+                    </div>
+                </div>
+            </div>
+            <div class="row border-primary px-3 mt-1">
+                <div class="col-3"></div>
+                <button type="button" class="btn btn-primary my-3 col-6" @onclick="UpdateUserSettings">
+                    <span class="@Spinner(Button.UpdateUserSettings)" style="width:1.2rem;height:1.2rem;"></span>
+                    <span class="@Hidden(Button.UpdateUserSettings)">Update</span>
+                </button>
+                <div class="col-3"></div>
+            </div>
+        </div>
+    </div>
+}
+
+@code{
+    private CurrentSettings? settings;
+    private Button? currentButton;
+    private bool isSuccess;
+
+    protected override async Task OnInitializedAsync()
+    {
+        settings = await Http.GetFromJsonAsync<CurrentSettings>("api/settings/get-setting-values");
+        StateHasChanged();
+    }
+
+    private async Task SetChargePriority(byte priority)
+    {
+        isSuccess = false;
+
+        currentButton = priority switch
+        {
+            ChargePriority.OnlySolar => Button.ChOnlySolar,
+            ChargePriority.SolarFirst => Button.ChSolarFirst,
+            ChargePriority.SolarAndUtility => Button.ChSolarAndUtility,
+            ChargePriority.UtilityFirst => Button.ChUtilityFirst,
+            _ => null
+        };
+
+        if (await Http.GetStringAsync($"api/settings/set-setting/{Setting.ChargePriority}/{priority}") == "true")
+        {
+            isSuccess = true;
+            UpdateLocalSetting(Setting.ChargePriority, priority);
+        }
+    }
+
+    private async Task SetOutputPriority(byte priority)
+    {
+        isSuccess = false;
+
+        currentButton = priority switch
+        {
+            OutputPriority.SolarFirst => Button.OpSolarFirst,
+            OutputPriority.SolarBatteryUtility => Button.OpSolarBatteryUtility,
+            OutputPriority.UtilityFirst => Button.OpUtilityFirst,
+            _ => null
+        };
+
+        if (await Http.GetStringAsync($"api/settings/set-setting/{Setting.OutputPriority}/{priority}") == "true")
+        {
+            isSuccess = true;
+            UpdateLocalSetting(Setting.OutputPriority, priority);
+        }
+    }
+
+    private async Task SetVoltage(Setting setting)
+    {
+        isSuccess = false;
+        double value = 0;
+
+        switch (setting)
+        {
+            case Setting.BulkVoltage:
+                currentButton = Button.BulkVoltage;
+                value = settings!.BulkChargeVoltage;
+
+                break;
+            case Setting.FloatVoltage:
+                currentButton = Button.FloatVoltage;
+                value = settings!.FloatChargeVoltage;
+
+                break;
+            case Setting.DischargeCutOff:
+                currentButton = Button.DischargeCutOff;
+                value = settings!.DischargeCuttOffVoltage;
+
+                break;
+            case Setting.BackToGrid:
+                currentButton = Button.BackToGridVoltage;
+                value = settings!.BackToGridVoltage;
+
+                break;
+            case Setting.BackToBattery:
+                currentButton = Button.BackToBattery;
+                value = settings!.BackToBatteryVoltage;
+
+                break;
+            case Setting.ChargePriority:
+            case Setting.OutputPriority:
+            case Setting.CombinedChargeCurrent:
+            case Setting.UtilityChargeCurrent:
+            default:
+                currentButton = null;
+
+                break;
+        }
+
+        if (await Http.GetStringAsync($"api/settings/set-setting/{setting}/{value}") == "true")
+        {
+            isSuccess = true;
+        }
+    }
+
+    private async Task SetChargeCurrent(Setting setting, byte value)
+    {
+        isSuccess = false;
+
+        currentButton = setting switch
+        {
+            Setting.CombinedChargeCurrent => Button.MaxCombinedChargeCurrent,
+            Setting.UtilityChargeCurrent => Button.MaxUtilityChargeCurrent,
+            _ => currentButton
+        };
+
+        if (await Http.GetStringAsync($"api/settings/set-setting/{setting}/{value}") == "true")
+        {
+            isSuccess = true;
+            UpdateLocalSetting(setting, value);
+        }
+    }
+
+    private void UpdateLocalSetting(Setting settingName, byte value)
+    {
+        // ReSharper disable once SwitchStatementMissingSomeEnumCasesNoDefault
+        switch (settingName)
+        {
+            case Setting.OutputPriority:
+                settings!.OutputPriority = value;
+
+                break;
+            case Setting.ChargePriority:
+                settings!.ChargePriority = value;
+
+                break;
+            case Setting.CombinedChargeCurrent:
+                settings!.MaxCombinedChargeCurrent = value;
+
+                break;
+            case Setting.UtilityChargeCurrent:
+                settings!.MaxACChargeCurrent = value;
+
+                break;
+        }
+    }
+
+    private async Task UpdateUserSettings()
+    {
+        currentButton = Button.UpdateUserSettings;
+        isSuccess = false;
+        await Http.PostAsJsonAsync("api/settings/set-system-spec", settings!.SystemSpec);
+        isSuccess = true;
+        currentButton = null;
+    }
+
+    private string Spinner(Button button)
+        => currentButton == button && !isSuccess
+               ? "spinner-border"
+               : "";
+
+    private string Hidden(Button button)
+        => currentButton == button && !isSuccess
+               ? "visually-hidden"
+               : "";
+
+    private string Success(Button button, byte currentValue, byte settingValue)
+        => (currentButton == button && isSuccess) || currentValue == settingValue
+               ? "oi oi-circle-check text-success"
+               : "";
+
+    private string Sanitize(string value)
+        => value.StartsWith("0") ? value[1..] : value;
+
+    private enum Button : byte
+    {
+        OpUtilityFirst = 1,        //never change this value
+        OpSolarFirst = 2,          //never change this value
+        OpSolarBatteryUtility = 3, //never change this value
+        ChOnlySolar = 4,
+        ChSolarFirst = 5,
+        ChSolarAndUtility = 6,
+        ChUtilityFirst = 7,
+        UpdateUserSettings = 8,
+        BackToGridVoltage = 9,
+        BackToBattery = 10,
+        DischargeCutOff = 11,
+        BulkVoltage = 12,
+        FloatVoltage = 13,
+        MaxCombinedChargeCurrent = 14,
+        MaxUtilityChargeCurrent = 15
+    }
+
+}

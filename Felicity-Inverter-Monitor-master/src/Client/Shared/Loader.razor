@@ -1,0 +1,16 @@
+﻿@if (Enabled)
+{
+    <div class="container w-100 text-center">
+        <div class="my-auto p-5 loader">
+            <span class="spinner-border"></span>
+            <div class="fw-bold">... Loading ...</div>
+        </div>
+    </div>
+}
+
+@code{
+
+    [Parameter]
+    public bool Enabled { get; set; }
+
+}
