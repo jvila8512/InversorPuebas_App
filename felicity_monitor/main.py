@@ -33,11 +33,12 @@ except ImportError:
     HAS_PYQTGRAPH = False
 
 from core.felicity_modbus import (
-    ModbusConnection, ModbusStatus, ModbusSettings,
+    ModbusConnection, ModbusStatus, ModbusSettings, ModbusInfo,
     OutputPriority, ChargePriority, WorkingMode, ChargeMode,
     list_serial_ports as list_ports_modbus,
     BAUD_RATES_MODBUS, PARITIES_MODBUS, DEFAULT_MODBUS_CONFIG
 )
+from core.modbus_tcp import ModbusTCPConnection
 from core.profiles import ProfileManager
 from core.tab_profiles import TabProfiles
 
@@ -179,6 +180,10 @@ class MetricCard(QFrame):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TabConnection(QWidget):
+    # Señal unificada: (tipo_conexion, params_dict)
+    # tipo_conexion: "serial" o "tcp"
+    # serial: {"port": "COM3", "baudrate": 2400, ...}
+    # tcp: {"host": "192.168.1.100", "port": 502, "timeout": 5.0}
     connect_requested = pyqtSignal(str, dict)
     disconnect_requested = pyqtSignal()
     autodetect_requested = pyqtSignal(str)
@@ -204,8 +209,24 @@ class TabConnection(QWidget):
         info_layout.addWidget(lbl_info)
         layout.addWidget(grp_info)
 
-        grp_port = QGroupBox("Configuración del puerto RS232")
-        g = QGridLayout(grp_port)
+        # ── Selector de tipo de conexión ──
+        grp_type = QGroupBox("Tipo de conexión")
+        gt = QHBoxLayout(grp_type)
+        self.cb_conn_type = QComboBox()
+        self.cb_conn_type.addItem("RS232 — Puerto serie (COM)", "serial")
+        self.cb_conn_type.addItem("TCP/IP — Gateway RS232→TCP", "tcp")
+        self.cb_conn_type.currentIndexChanged.connect(self._on_type_changed)
+        gt.addWidget(self.cb_conn_type)
+        layout.addWidget(grp_type)
+
+        # ── Stack de configuración: RS232 o TCP ──
+        self.config_stack = QWidget()
+        stack_layout = QVBoxLayout(self.config_stack)
+        stack_layout.setContentsMargins(0, 0, 0, 0)
+
+        # --- Panel RS232 ---
+        self.grp_serial = QGroupBox("Configuración RS232")
+        g = QGridLayout(self.grp_serial)
 
         g.addWidget(QLabel("Puerto:"), 0, 0)
         self.cb_port = QComboBox()
@@ -236,7 +257,41 @@ class TabConnection(QWidget):
         self.sp_timeout.setSingleStep(0.5)
         g.addWidget(self.sp_timeout, 3, 1)
 
-        layout.addWidget(grp_port)
+        stack_layout.addWidget(self.grp_serial)
+
+        # --- Panel TCP/IP ---
+        self.grp_tcp = QGroupBox("Configuración TCP/IP (Gateway RS232→TCP)")
+        gtcp = QGridLayout(self.grp_tcp)
+
+        gtcp.addWidget(QLabel("Host / IP:"), 0, 0)
+        self.le_tcp_host = QLineEdit("192.168.1.100")
+        self.le_tcp_host.setPlaceholderText("Ej: 192.168.1.100")
+        gtcp.addWidget(self.le_tcp_host, 0, 1)
+
+        gtcp.addWidget(QLabel("Puerto TCP:"), 1, 0)
+        self.sp_tcp_port = QSpinBox()
+        self.sp_tcp_port.setRange(1, 65535)
+        self.sp_tcp_port.setValue(502)
+        self.sp_tcp_port.setToolTip("Puerto por defecto Modbus TCP: 502")
+        gtcp.addWidget(self.sp_tcp_port, 1, 1)
+
+        gtcp.addWidget(QLabel("Timeout (s):"), 2, 0)
+        self.sp_tcp_timeout = QDoubleSpinBox()
+        self.sp_tcp_timeout.setRange(1.0, 30.0)
+        self.sp_tcp_timeout.setValue(5.0)
+        self.sp_tcp_timeout.setSingleStep(0.5)
+        gtcp.addWidget(self.sp_tcp_timeout, 2, 1)
+
+        lbl_tcp_note = QLabel(
+            "Usá un gateway RS232→TCP (USR-TCP232, Moxa NPort, etc.)\n"
+            "El gateway encapsula los frames Modbus RTU por TCP de forma transparente."
+        )
+        lbl_tcp_note.setStyleSheet("color:#888; font-size:10px;")
+        gtcp.addWidget(lbl_tcp_note, 3, 0, 1, 2)
+
+        stack_layout.addWidget(self.grp_tcp)
+
+        layout.addWidget(self.config_stack)
 
         row_btns = QHBoxLayout()
         self.btn_connect = QPushButton("Conectar Modbus")
@@ -271,6 +326,21 @@ class TabConnection(QWidget):
         layout.addWidget(self.lbl_status)
 
         self.refresh_ports()
+        # Inicializar visibilidad de paneles según tipo de conexión
+        self._on_type_changed(0)
+
+    def _on_type_changed(self, index: int):
+        """Muestra/oculta el panel de config según tipo de conexión."""
+        conn_type = self.cb_conn_type.currentData()
+        is_serial = (conn_type == "serial")
+        self.grp_serial.setVisible(is_serial)
+        self.grp_tcp.setVisible(not is_serial)
+        # Auto-detectar solo tiene sentido en serial
+        self.btn_autodetect.setEnabled(is_serial)
+
+    def get_connection_type(self) -> str:
+        """Retorna 'serial' o 'tcp'."""
+        return self.cb_conn_type.currentData() or "serial"
 
     def refresh_ports(self):
         self.cb_port.clear()
@@ -281,19 +351,34 @@ class TabConnection(QWidget):
         else:
             self.cb_port.addItem("(sin puertos)")
 
-    def _get_config(self) -> dict:
+    def _get_serial_config(self) -> dict:
         return {
+            'port': self.cb_port.currentText(),
             'baudrate': self.cb_baud.currentData(),
             'parity': self.cb_parity.currentData(),
             'stopbits': serial.STOPBITS_ONE,
             'timeout': self.sp_timeout.value(),
         }
 
+    def _get_tcp_config(self) -> dict:
+        return {
+            'host': self.le_tcp_host.text().strip(),
+            'port': self.sp_tcp_port.value(),
+            'timeout': self.sp_tcp_timeout.value(),
+        }
+
     def _on_connect(self):
-        port = self.cb_port.currentText()
-        if not port or port == "(sin puertos)":
-            return
-        self.connect_requested.emit(port, self._get_config())
+        conn_type = self.get_connection_type()
+        if conn_type == "serial":
+            port = self.cb_port.currentText()
+            if not port or port == "(sin puertos)":
+                return
+            self.connect_requested.emit("serial", self._get_serial_config())
+        else:
+            host = self.le_tcp_host.text().strip()
+            if not host:
+                return
+            self.connect_requested.emit("tcp", self._get_tcp_config())
 
     def _on_autodetect(self):
         port = self.cb_port.currentText()
@@ -327,62 +412,259 @@ class TabConnection(QWidget):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TabMonitor(QWidget):
+    """Monitor en tiempo real con todos los parámetros del protocolo.
+
+    TODO: Conectar settings_received del monitor thread a update_settings_display:
+        self._monitor.settings_received.connect(self.tab_monitor.update_settings_display)
+    El signal info_received ya está conectado a update_info en MainWindow._start_monitor().
+    """
     poll_interval_changed = pyqtSignal(float)
 
     def __init__(self):
         super().__init__()
-        self._history = {k: deque(maxlen=120) for k in
-                         ['grid_v', 'batt_v', 'batt_charge_a', 'load', 'pv_w', 'output_w']}
+        self._history = {k: deque(maxlen=120) for k in [
+            'grid_v', 'batt_v', 'batt_charge_a', 'load', 'pv_w',
+            'output_w', 'grid_freq', 'output_va',
+        ]}
         self._build_ui()
 
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _make_bool_label(text: str = "—") -> QLabel:
+        """Crea un QLabel para un flag booleano con estilo verde/gris."""
+        lbl = QLabel(text)
+        lbl.setStyleSheet("color:#555; font-size:12px;")
+        return lbl
+
+    @staticmethod
+    def _style_bool(lbl: QLabel, value: bool):
+        if value:
+            lbl.setStyleSheet("color:#27ae60; font-size:12px; font-weight:bold;")
+        else:
+            lbl.setStyleSheet("color:#555; font-size:12px;")
+
+    @staticmethod
+    def _make_enum_label(text: str = "—") -> QLabel:
+        """Crea un QLabel para un valor de enum con estilo cyan."""
+        lbl = QLabel(text)
+        lbl.setStyleSheet("color:#00d2ff; font-size:12px; font-weight:bold;")
+        return lbl
+
+    @staticmethod
+    def _info_row(grid: QGridLayout, row: int, label: str, widget: QWidget):
+        """Agrega una fila (QLabel + widget) a un QGridLayout."""
+        lbl = QLabel(label)
+        lbl.setStyleSheet("color:#888; font-size:12px;")
+        grid.addWidget(lbl, row, 0)
+        grid.addWidget(widget, row, 1)
+
+    # ── construcción de UI ───────────────────────────────────────────────────
+
     def _build_ui(self):
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
         layout.setSpacing(10)
+        layout.setContentsMargins(10, 10, 10, 10)
 
-        grp_metrics = QGroupBox("Parámetros en tiempo real (Modbus)")
-        grid = QGridLayout(grp_metrics)
-        grid.setSpacing(8)
+        # ── Sección 1: Información del Dispositivo ────────────────────────────
+        grp_info = QGroupBox("Información del Dispositivo")
+        gi = QGridLayout(grp_info)
+        gi.setColumnStretch(1, 1)
 
-        self.cards = {
-            'grid_v':      MetricCard("Tensión red", "V", warn_high=250),
-            'out_v':       MetricCard("Tensión salida", "V"),
-            'out_w':       MetricCard("Potencia salida", "W"),
-            'load_pct':    MetricCard("Carga", "%"),
-            'batt_v':      MetricCard("Batería", "V"),
-            'batt_charge': MetricCard("Carga bat.", "A"),
-            'batt_dis':    MetricCard("Descarga bat.", "A"),
-            'pv_v':        MetricCard("Tensión PV", "V"),
-            'pv_w':        MetricCard("Potencia PV", "W"),
-        }
+        self.info_type = self._make_enum_label()
+        self.info_subtype = self._make_enum_label()
+        self.info_serial = self._make_enum_label()
+        self.info_cpu1 = self._make_enum_label()
+        self.info_cpu2 = self._make_enum_label()
 
-        positions = [
-            ('grid_v', 0, 0), ('out_v', 0, 1), ('out_w', 0, 2),
-            ('load_pct', 0, 3), ('batt_v', 1, 0), ('batt_charge', 1, 1),
-            ('batt_dis', 1, 2), ('pv_v', 1, 3), ('pv_w', 2, 0),
+        self._info_row(gi, 0, "Tipo de Equipo:", self.info_type)
+        self._info_row(gi, 1, "Subtipo:", self.info_subtype)
+        self._info_row(gi, 2, "Número de Serie:", self.info_serial)
+        self._info_row(gi, 3, "Firmware CPU1:", self.info_cpu1)
+        self._info_row(gi, 4, "Firmware CPU2:", self.info_cpu2)
+        layout.addWidget(grp_info)
+
+        # ── Sección 2: Datos en Tiempo Real ──────────────────────────────────
+        grp_rt = QGroupBox("Datos en Tiempo Real")
+        rt_layout = QVBoxLayout(grp_rt)
+        rt_layout.setSpacing(8)
+
+        # — Batería —
+        grp_bat = QGroupBox("Batería")
+        gb = QGridLayout(grp_bat)
+        gb.setSpacing(8)
+        self.cards = {}
+        bat_cards = [
+            ('batt_v', "Voltaje", "V", None, 0, 0),
+            ('batt_charge_a', "Cargando", "A", None, 0, 1),
+            ('batt_discharge_a', "Descargando", "A", None, 0, 2),
+            ('batt_charge_w', "Pot. Carga", "W", None, 1, 0),
+            ('batt_discharge_w', "Pot. Desc.", "W", None, 1, 1),
         ]
-        for key, row, col in positions:
-            grid.addWidget(self.cards[key], row, col)
+        for key, title, unit, warn, r, c in bat_cards:
+            card = MetricCard(title, unit, warn_high=warn)
+            self.cards[key] = card
+            gb.addWidget(card, r, c)
 
-        layout.addWidget(grp_metrics)
+        # Flujo batería (enum)
+        self.lbl_batt_flow = self._make_enum_label()
+        self._info_row(gb, 2, "Flujo:", self.lbl_batt_flow)
+        # Conectada (bool)
+        self.lbl_batt_conn = self._make_bool_label()
+        self._info_row(gb, 3, "Conectada:", self.lbl_batt_conn)
+        rt_layout.addWidget(grp_bat)
 
-        row_status = QHBoxLayout()
+        # — Red / AC Entrada —
+        grp_grid = QGroupBox("Red / AC Entrada")
+        gg = QGridLayout(grp_grid)
+        gg.setSpacing(8)
+        grid_cards = [
+            ('grid_v', "Voltaje", "V", 250, 0, 0),
+            ('grid_freq', "Frecuencia", "Hz", None, 0, 1),
+        ]
+        for key, title, unit, warn, r, c in grid_cards:
+            card = MetricCard(title, unit, warn_high=warn)
+            self.cards[key] = card
+            gg.addWidget(card, r, c)
+        self.lbl_line_status = self._make_bool_label()
+        self._info_row(gg, 1, "Estado:", self.lbl_line_status)
+        self.lbl_line_flow = self._make_enum_label()
+        self._info_row(gg, 2, "Flujo:", self.lbl_line_flow)
+        rt_layout.addWidget(grp_grid)
 
-        self.lbl_mode = QLabel("Modo: —")
-        self.lbl_mode.setStyleSheet("font-size:14px; font-weight:bold; color:#e94560; padding:4px 12px; background:#16213e; border-radius:6px;")
+        # — PV / Panel Solar —
+        grp_pv = QGroupBox("PV / Panel Solar")
+        gpv = QGridLayout(grp_pv)
+        gpv.setSpacing(8)
+        pv_cards = [
+            ('pv_v', "Voltaje", "V", None, 0, 0),
+            ('pv_w', "Potencia", "W", None, 0, 1),
+        ]
+        for key, title, unit, warn, r, c in pv_cards:
+            card = MetricCard(title, unit, warn_high=warn)
+            self.cards[key] = card
+            gpv.addWidget(card, r, c)
+        self.lbl_mppt = self._make_bool_label()
+        self._info_row(gpv, 1, "MPPT:", self.lbl_mppt)
+        rt_layout.addWidget(grp_pv)
 
-        self.lbl_charge_mode = QLabel("Carga: —")
-        self.lbl_charge_mode.setStyleSheet("font-size:12px; padding:4px 10px; background:#1a3a2a; color:#27ae60; border-radius:6px;")
+        # — Salida AC —
+        grp_out = QGroupBox("Salida AC")
+        go = QGridLayout(grp_out)
+        go.setSpacing(8)
+        out_cards = [
+            ('out_v', "Voltaje", "V", None, 0, 0),
+            ('out_w', "Potencia Activa", "W", None, 0, 1),
+            ('out_va', "Potencia Aparente", "VA", None, 0, 2),
+            ('load_pct', "Carga", "%", None, 1, 0),
+        ]
+        for key, title, unit, warn, r, c in out_cards:
+            card = MetricCard(title, unit, warn_high=warn)
+            self.cards[key] = card
+            go.addWidget(card, r, c)
+        self.lbl_load_conn = self._make_bool_label()
+        self._info_row(go, 1, "Conectada:", self.lbl_load_conn)
+        rt_layout.addWidget(grp_out)
 
-        self.pb_load = QProgressBar()
-        self.pb_load.setRange(0, 100)
-        self.pb_load.setValue(0)
-        self.pb_load.setFormat("Carga: %p%")
+        # — Estado / Flags —
+        grp_flags = QGroupBox("Estado / Flags")
+        gf = QGridLayout(grp_flags)
+        gf.setColumnStretch(1, 1)
+        self.lbl_work_mode = self._make_enum_label()
+        self._info_row(gf, 0, "Modo de Trabajo:", self.lbl_work_mode)
+        self.lbl_charge_mode = self._make_enum_label()
+        self._info_row(gf, 1, "Modo de Carga:", self.lbl_charge_mode)
+        self.lbl_fault = QLabel("0")
+        self.lbl_fault.setStyleSheet("color:#e74c3c; font-size:12px; font-weight:bold;")
+        self._info_row(gf, 2, "Código de Falla:", self.lbl_fault)
+        self.lbl_load_allowed = self._make_bool_label()
+        self._info_row(gf, 3, "Carga Permitida:", self.lbl_load_allowed)
+        self.lbl_pf_supported = self._make_bool_label()
+        self._info_row(gf, 4, "PowerFlow Soportado:", self.lbl_pf_supported)
+        self.lbl_setting_sn = QLabel("0")
+        self.lbl_setting_sn.setStyleSheet("color:#888; font-size:12px;")
+        self._info_row(gf, 5, "SettingDataSN:", self.lbl_setting_sn)
+        rt_layout.addWidget(grp_flags)
 
-        row_status.addWidget(self.lbl_mode)
-        row_status.addWidget(self.lbl_charge_mode)
-        row_status.addWidget(self.pb_load, 2)
-        layout.addLayout(row_status)
+        layout.addWidget(grp_rt)
 
+        # ── Sección 3: Parámetros de Configuración (solo lectura) ─────────────
+        grp_cfg = QGroupBox("Parámetros de Configuración (solo lectura)")
+        gc = QVBoxLayout(grp_cfg)
+        gc.setSpacing(6)
+
+        # Voltajes
+        grp_cv = QGroupBox("Voltajes de Batería")
+        gcv = QGridLayout(grp_cv)
+        gcv.setColumnStretch(1, 1)
+        self.cfg_cutoff = QLabel("— V")
+        self.cfg_cutoff.setStyleSheet("color:#00d2ff; font-weight:bold;")
+        self._info_row(gcv, 0, "Voltaje Corte:", self.cfg_cutoff)
+        self.cfg_absorb = QLabel("— V")
+        self.cfg_absorb.setStyleSheet("color:#00d2ff; font-weight:bold;")
+        self._info_row(gcv, 1, "Voltaje Absorción:", self.cfg_absorb)
+        self.cfg_float = QLabel("— V")
+        self.cfg_float.setStyleSheet("color:#00d2ff; font-weight:bold;")
+        self._info_row(gcv, 2, "Voltaje Flotación:", self.cfg_float)
+        self.cfg_recharge = QLabel("— V")
+        self.cfg_recharge.setStyleSheet("color:#00d2ff; font-weight:bold;")
+        self._info_row(gcv, 3, "Voltaje Regreso a Red:", self.cfg_recharge)
+        self.cfg_back_bat = QLabel("— V")
+        self.cfg_back_bat.setStyleSheet("color:#00d2ff; font-weight:bold;")
+        self._info_row(gcv, 4, "Voltaje Regreso a Batería:", self.cfg_back_bat)
+        gc.addWidget(grp_cv)
+
+        # Otros parámetros
+        grp_cp = QGridLayout()
+        grp_cp.setColumnStretch(1, 1)
+        row = 0
+        self.cfg_freq = self._make_enum_label()
+        self._info_row(grp_cp, row, "Frecuencia Salida:", self.cfg_freq); row += 1
+        self.cfg_app_mode = self._make_enum_label()
+        self._info_row(grp_cp, row, "Modo Aplicación:", self.cfg_app_mode); row += 1
+        self.cfg_bat_type = self._make_enum_label()
+        self._info_row(grp_cp, row, "Tipo Batería:", self.cfg_bat_type); row += 1
+        self.cfg_out_prio = self._make_enum_label()
+        self._info_row(grp_cp, row, "Prioridad Salida:", self.cfg_out_prio); row += 1
+        self.cfg_chg_prio = self._make_enum_label()
+        self._info_row(grp_cp, row, "Prioridad Carga:", self.cfg_chg_prio); row += 1
+        self.cfg_max_charge = QLabel("— A")
+        self.cfg_max_charge.setStyleSheet("color:#00d2ff; font-weight:bold;")
+        self._info_row(grp_cp, row, "Corriente Máx Carga:", self.cfg_max_charge); row += 1
+        self.cfg_max_ac = QLabel("— A")
+        self.cfg_max_ac.setStyleSheet("color:#00d2ff; font-weight:bold;")
+        self._info_row(grp_cp, row, "Corriente Máx Carga AC:", self.cfg_max_ac); row += 1
+        gc.addLayout(grp_cp)
+
+        # Flags
+        grp_cf = QGridLayout()
+        grp_cf.setColumnStretch(1, 1)
+        row = 0
+        self.cfg_buzzer = self._make_bool_label()
+        self._info_row(grp_cf, row, "Buzzer:", self.cfg_buzzer); row += 1
+        self.cfg_overload_rst = self._make_bool_label()
+        self._info_row(grp_cf, row, "Reinicio Sobrecarga:", self.cfg_overload_rst); row += 1
+        self.cfg_overtemp_rst = self._make_bool_label()
+        self._info_row(grp_cf, row, "Reinicio Sobretemp:", self.cfg_overtemp_rst); row += 1
+        self.cfg_backlight = self._make_bool_label()
+        self._info_row(grp_cf, row, "Backlight LCD:", self.cfg_backlight); row += 1
+        self.cfg_overload_bypass = self._make_bool_label()
+        self._info_row(grp_cf, row, "Sobrecarga→Bypass:", self.cfg_overload_bypass); row += 1
+        gc.addLayout(grp_cf)
+
+        layout.addWidget(grp_cfg)
+
+        # ── Controles: intervalo + latencia ──────────────────────────────────
         row_interval = QHBoxLayout()
         row_interval.addWidget(QLabel("Intervalo polling:"))
         self.sl_interval = QSlider(Qt.Horizontal)
@@ -403,13 +685,17 @@ class TabMonitor(QWidget):
         row_interval.addWidget(self.lbl_latency)
         layout.addLayout(row_interval)
 
+        # ── Gráfico histórico ────────────────────────────────────────────────
         if HAS_PYQTGRAPH:
             grp_graph = QGroupBox("Histórico (últimos 120 puntos)")
             gv = QVBoxLayout(grp_graph)
 
             self.graph_select = QComboBox()
-            for label in ['Tensión batería (V)', 'Potencia PV (W)',
-                          'Potencia salida (W)', 'Carga (%)', 'Tensión red (V)']:
+            for label in [
+                'Tensión batería (V)', 'Potencia PV (W)',
+                'Potencia salida (W)', 'Carga (%)', 'Tensión red (V)',
+                'Frecuencia red (Hz)', 'Potencia aparente (VA)',
+            ]:
                 self.graph_select.addItem(label)
             self.graph_select.currentIndexChanged.connect(self._update_graph)
             gv.addWidget(self.graph_select)
@@ -422,39 +708,108 @@ class TabMonitor(QWidget):
             gv.addWidget(self.plot_widget)
             layout.addWidget(grp_graph)
 
+        layout.addStretch()
+        scroll.setWidget(container)
+        outer.addWidget(scroll)
+
+    # ── actualización de datos ───────────────────────────────────────────────
+
     def update_data(self, status: ModbusStatus):
-        self.cards['grid_v'].update(status.grid_voltage)
-        self.cards['out_v'].update(status.output_voltage)
-        self.cards['out_w'].update(status.load_watts, 0)
-        self.cards['load_pct'].update(status.load_percent, 0)
+        """Actualiza TODOS los campos de datos en tiempo real."""
+        # Batería
         self.cards['batt_v'].update(status.battery_voltage)
-        self.cards['batt_charge'].update(status.battery_charge_a)
-        self.cards['batt_dis'].update(status.battery_discharge_a)
+        self.cards['batt_charge_a'].update(status.battery_charge_a)
+        self.cards['batt_discharge_a'].update(status.battery_discharge_a)
+        self.cards['batt_charge_w'].update(status.battery_charge_w, 0)
+        self.cards['batt_discharge_w'].update(status.battery_discharge_w, 0)
+        self.lbl_batt_flow.setText(status.battery_flow)
+        self._style_bool(self.lbl_batt_conn, status.battery_connected)
+
+        # Red / AC Entrada
+        self.cards['grid_v'].update(status.grid_voltage)
+        self.cards['grid_freq'].update(status.grid_frequency, 2)
+        self._style_bool(self.lbl_line_status, status.line_normal)
+        self.lbl_line_flow.setText(status.line_flow)
+
+        # PV / Panel Solar
         self.cards['pv_v'].update(status.pv_voltage)
         self.cards['pv_w'].update(status.pv_power, 0)
+        self._style_bool(self.lbl_mppt, status.pv_mppt_working)
 
-        self.pb_load.setValue(status.load_percent)
+        # Salida AC
+        self.cards['out_v'].update(status.output_voltage)
+        self.cards['out_w'].update(status.load_watts, 0)
+        self.cards['out_va'].update(status.output_apparent_power, 0)
+        self.cards['load_pct'].update(status.load_percent, 0)
+        self._style_bool(self.lbl_load_conn, status.load_connected)
 
-        mode_str = str(status.working_mode).replace('_', ' ')
-        self.lbl_mode.setText(f"Modo: {mode_str}")
+        # Estado / Flags
+        self.lbl_work_mode.setText(str(status.working_mode).replace('_', ' '))
+        self.lbl_charge_mode.setText(str(status.charge_mode).replace('_', ' '))
+        fault = status.fault_code
+        if fault == 0:
+            self.lbl_fault.setText("Sin falla")
+            self.lbl_fault.setStyleSheet("color:#27ae60; font-size:12px; font-weight:bold;")
+        else:
+            self.lbl_fault.setText(str(fault))
+            self.lbl_fault.setStyleSheet("color:#e74c3c; font-size:12px; font-weight:bold;")
+        self._style_bool(self.lbl_load_allowed, status.load_connect_allowed)
+        self._style_bool(self.lbl_pf_supported, status.power_flow_supported)
+        self.lbl_setting_sn.setText(str(status.setting_data_sn))
 
-        charge_str = str(status.charge_mode).replace('_', ' ')
-        self.lbl_charge_mode.setText(f"Estado carga: {charge_str}")
-
+        # Historial para gráfico
         self._history['batt_v'].append(status.battery_voltage)
         self._history['pv_w'].append(status.pv_power)
         self._history['output_w'].append(status.load_watts)
         self._history['load'].append(status.load_percent)
         self._history['grid_v'].append(status.grid_voltage)
+        self._history['grid_freq'].append(status.grid_frequency)
+        self._history['output_va'].append(status.output_apparent_power)
 
         if HAS_PYQTGRAPH:
             self._update_graph()
+
+    def update_info(self, info: ModbusInfo):
+        """Actualiza la sección de información del dispositivo."""
+        self.info_type.setText(info.equipment_type_str)
+        self.info_subtype.setText(info.sub_type_str)
+        self.info_serial.setText(info.serial_number or "—")
+        self.info_cpu1.setText(info.cpu1_fw_str)
+        self.info_cpu2.setText(info.cpu2_fw_str)
+
+    def update_settings_display(self, settings: ModbusSettings):
+        """Actualiza la sección de parámetros de configuración (solo lectura)."""
+        # Voltajes
+        self.cfg_cutoff.setText(f"{settings.battery_cutoff_voltage:.1f} V")
+        self.cfg_absorb.setText(f"{settings.battery_cv_voltage:.1f} V")
+        self.cfg_float.setText(f"{settings.battery_float_voltage:.1f} V")
+        self.cfg_recharge.setText(f"{settings.battery_back_to_grid_voltage:.1f} V")
+        self.cfg_back_bat.setText(f"{settings.battery_back_to_battery_voltage:.1f} V")
+        # Otros parámetros
+        self.cfg_freq.setText(settings.ac_output_frequency_str)
+        self.cfg_app_mode.setText(settings.application_mode_str)
+        self.cfg_bat_type.setText(settings.battery_type_str)
+        self.cfg_out_prio.setText(str(settings.output_priority).replace('_', ' '))
+        self.cfg_chg_prio.setText(str(settings.charge_priority).replace('_', ' '))
+        self.cfg_max_charge.setText(f"{settings.max_charge_current} A")
+        self.cfg_max_ac.setText(f"{settings.max_ac_charge_current} A")
+        # Flags
+        self._style_bool(self.cfg_buzzer, settings.buzzer_enabled)
+        self.cfg_buzzer.setText("Activado" if settings.buzzer_enabled else "Desactivado")
+        self._style_bool(self.cfg_overload_rst, settings.overload_restart)
+        self.cfg_overload_rst.setText("Activado" if settings.overload_restart else "Desactivado")
+        self._style_bool(self.cfg_overtemp_rst, settings.over_temp_restart)
+        self.cfg_overtemp_rst.setText("Activado" if settings.over_temp_restart else "Desactivado")
+        self._style_bool(self.cfg_backlight, settings.lcd_backlight)
+        self.cfg_backlight.setText("Activado" if settings.lcd_backlight else "Desactivado")
+        self._style_bool(self.cfg_overload_bypass, settings.overload_to_bypass)
+        self.cfg_overload_bypass.setText("Activado" if settings.overload_to_bypass else "Desactivado")
 
     def _update_graph(self):
         if not HAS_PYQTGRAPH:
             return
         idx = self.graph_select.currentIndex()
-        keys = ['batt_v', 'pv_w', 'output_w', 'load', 'grid_v']
+        keys = ['batt_v', 'pv_w', 'output_w', 'load', 'grid_v', 'grid_freq', 'output_va']
         key = keys[idx]
         data = list(self._history[key])
         if data:
@@ -488,6 +843,7 @@ class TabSettings(QWidget):
         row_btns.addWidget(self.btn_read)
         layout.addLayout(row_btns)
 
+        # ── Voltajes de batería ──
         grp_bat = QGroupBox("Configuración de Batería (Registros 0x211F - 0x2159)")
         grid = QGridLayout(grp_bat)
 
@@ -511,7 +867,8 @@ class TabSettings(QWidget):
 
         layout.addWidget(grp_bat)
 
-        grp_prio = QGroupBox("Prioridades")
+        # ── Prioridades y corrientes ──
+        grp_prio = QGroupBox("Prioridades y Corrientes")
         grid2 = QGridLayout(grp_prio)
 
         self.lbl_out_prio = QLabel("—")
@@ -531,6 +888,36 @@ class TabSettings(QWidget):
             grid2.addWidget(value_lbl, i, 1)
 
         layout.addWidget(grp_prio)
+
+        # ── Configuración adicional ──
+        grp_extra = QGroupBox("Configuración Adicional")
+        grid3 = QGridLayout(grp_extra)
+
+        self.lbl_ac_freq = QLabel("—")
+        self.lbl_app_mode = QLabel("—")
+        self.lbl_bat_type = QLabel("—")
+        self.lbl_buzzer = QLabel("—")
+        self.lbl_overload_restart = QLabel("—")
+        self.lbl_overtemp_restart = QLabel("—")
+        self.lbl_backlight = QLabel("—")
+        self.lbl_overload_bypass = QLabel("—")
+
+        extra_items = [
+            ("Frecuencia salida AC (0x2129):", self.lbl_ac_freq),
+            ("Modo aplicación (0x212B):", self.lbl_app_mode),
+            ("Tipo batería (0x212D):", self.lbl_bat_type),
+            ("Buzzer (0x2131):", self.lbl_buzzer),
+            ("Reinicio sobrecarga (0x2133):", self.lbl_overload_restart),
+            ("Reinicio sobretemp (0x2134):", self.lbl_overtemp_restart),
+            ("Backlight LCD (0x2135):", self.lbl_backlight),
+            ("Sobrecarga → Bypass (0x2137):", self.lbl_overload_bypass),
+        ]
+        for i, (label, value_lbl) in enumerate(extra_items):
+            grid3.addWidget(QLabel(label), i, 0)
+            value_lbl.setStyleSheet("color:#00d2ff; font-weight:bold;")
+            grid3.addWidget(value_lbl, i, 1)
+
+        layout.addWidget(grp_extra)
 
         grp_raw = QGroupBox("Registros crudos (hexdump)")
         gl = QVBoxLayout(grp_raw)
@@ -556,6 +943,32 @@ class TabSettings(QWidget):
         self.lbl_charge_prio.setText(str(settings.charge_priority))
         self.lbl_max_charge.setText(f"{settings.max_charge_current} A")
         self.lbl_max_ac.setText(f"{settings.max_ac_charge_current} A")
+
+        # Nuevos campos
+        self.lbl_ac_freq.setText(settings.ac_output_frequency_str)
+        self.lbl_app_mode.setText(settings.application_mode_str)
+        self.lbl_bat_type.setText(settings.battery_type_str)
+
+        def bool_str(val: bool) -> str:
+            return "Activado" if val else "Desactivado"
+
+        def bool_style(val: bool) -> str:
+            return "color:#27ae60; font-weight:bold;" if val else "color:#555; font-weight:bold;"
+
+        self.lbl_buzzer.setText(bool_str(settings.buzzer_enabled))
+        self.lbl_buzzer.setStyleSheet(bool_style(settings.buzzer_enabled))
+
+        self.lbl_overload_restart.setText(bool_str(settings.overload_restart))
+        self.lbl_overload_restart.setStyleSheet(bool_style(settings.overload_restart))
+
+        self.lbl_overtemp_restart.setText(bool_str(settings.over_temp_restart))
+        self.lbl_overtemp_restart.setStyleSheet(bool_style(settings.over_temp_restart))
+
+        self.lbl_backlight.setText(bool_str(settings.lcd_backlight))
+        self.lbl_backlight.setStyleSheet(bool_style(settings.lcd_backlight))
+
+        self.lbl_overload_bypass.setText(bool_str(settings.overload_to_bypass))
+        self.lbl_overload_bypass.setStyleSheet(bool_style(settings.overload_to_bypass))
 
         if settings.raw_registers:
             hex_str = ' '.join(f"{x:04X}" for x in settings.raw_registers[:30])
@@ -1479,12 +1892,13 @@ class TabAPI(QWidget):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ModbusMonitorThread(QThread):
-    data_received = pyqtSignal(object)
+    data_received = pyqtSignal(object)       # ModbusStatus
     error_occurred = pyqtSignal(str)
     latency_update = pyqtSignal(float)
-    settings_received = pyqtSignal(object)
+    settings_received = pyqtSignal(object)   # ModbusSettings
+    info_received = pyqtSignal(object)       # ModbusInfo
 
-    def __init__(self, conn: ModbusConnection, interval: float = 3.0):
+    def __init__(self, conn, interval: float = 3.0):
         super().__init__()
         self.conn = conn
         self.interval = interval
@@ -1514,10 +1928,18 @@ class ModbusMonitorThread(QThread):
         self.data_received.emit(status)
 
         self._poll_counter += 1
+        # Cada 10 polls: leer settings
         if self._poll_counter % 10 == 0:
             settings = self.conn.read_settings()
             if settings:
                 self.settings_received.emit(settings)
+
+        # Cada 30 polls: leer info del dispositivo
+        if self._poll_counter % 30 == 0:
+            if hasattr(self.conn, 'read_info'):
+                info = self.conn.read_info()
+                if info:
+                    self.info_received.emit(info)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1527,7 +1949,7 @@ class ModbusMonitorThread(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Felicity Inverter Monitor — Modbus RTU (9 params + Scanner)")
+        self.setWindowTitle("Felicity Inverter Monitor — Modbus RTU (RS232 / TCP) + Scanner")
         self.setMinimumSize(1200, 900)
         self.setStyleSheet(STYLE)
 
@@ -1575,10 +1997,25 @@ class MainWindow(QMainWindow):
         self.tab_monitor.poll_interval_changed.connect(self._on_interval_changed)
 
     def _build_status_bar(self):
-        self.statusBar().showMessage("Listo · Protocolo: Modbus RTU · 9 parámetros + Scanner")
+        self.statusBar().showMessage("Listo · Protocolo: Modbus RTU · RS232 / TCP + Scanner")
 
-    def _on_connect(self, port: str, config: dict):
-        self._conn = ModbusConnection(port, config)
+    def _on_connect(self, conn_type: str, config: dict):
+        """Conecta al inversor via RS232 o TCP/IP según corresponda."""
+        if conn_type == "tcp":
+            host = config.get('host', '')
+            port = config.get('port', 502)
+            timeout = config.get('timeout', 5.0)
+            if not host:
+                return
+            self._conn = ModbusTCPConnection(host, port, timeout)
+        else:
+            port = config.get('port', '')
+            if not port or port == "(sin puertos)":
+                return
+            # ModbusConnection necesita port como primer arg y el resto como config
+            serial_config = {k: v for k, v in config.items() if k != 'port'}
+            self._conn = ModbusConnection(port, serial_config)
+
         ok, msg = self._conn.connect()
         self.tab_conn.set_connected(ok, msg)
         self.tab_conn.log(msg, '#27ae60' if ok else '#e74c3c')
@@ -1613,6 +2050,8 @@ class MainWindow(QMainWindow):
         self._monitor.latency_update.connect(self.tab_monitor.update_latency)
         self._monitor.settings_received.connect(self.tab_settings.update_settings)
         self._monitor.settings_received.connect(self.tab_control.update_from_settings)
+        self._monitor.settings_received.connect(self.tab_monitor.update_settings_display)
+        self._monitor.info_received.connect(self.tab_monitor.update_info)
         self._monitor.start()
 
     def _stop_monitor(self):
