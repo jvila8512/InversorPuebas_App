@@ -1,0 +1,7 @@
+Simple, ejecutá esto:
+python felicity_monitor/main.py
+Desde el directorio del proyecto:
+cd C:\Proyectos\Python\InversorApp\inversor_app
+python felicity_monitor/main.py
+Si te falta alguna dependencia, instalala con:
+pip install -r requirements.txt

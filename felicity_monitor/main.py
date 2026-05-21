@@ -317,6 +317,20 @@ class TabConnection(QWidget):
         self.txt_log.setReadOnly(True)
         self.txt_log.setMinimumHeight(200)
         self.txt_log.setPlaceholderText("Log de comunicación Modbus RTU...")
+
+        btn_clear = QPushButton("🗑 Limpiar log")
+        btn_clear.setObjectName("btn_clear_log")
+        btn_clear.setStyleSheet(
+            "QPushButton { background:#34495e; color:#fff; padding:4px 12px; "
+            "border-radius:3px; font-size:11px; }"
+            "QPushButton:hover { background:#4a6785; }"
+        )
+        btn_clear.clicked.connect(self.txt_log.clear)
+
+        log_header = QHBoxLayout()
+        log_header.addStretch()
+        log_header.addWidget(btn_clear)
+        gl.addLayout(log_header)
         gl.addWidget(self.txt_log)
         layout.addWidget(grp_log)
 
@@ -328,6 +342,9 @@ class TabConnection(QWidget):
         self.refresh_ports()
         # Inicializar visibilidad de paneles según tipo de conexión
         self._on_type_changed(0)
+        # Mensaje de inicio
+        self.log("Felicity Inverter Monitor iniciado — Modbus RTU (RS232 / TCP)", '#3498db')
+        self.log("Configurá el tipo de conexión y presioná 'Conectar Modbus'", '#888')
 
     def _on_type_changed(self, index: int):
         """Muestra/oculta el panel de config según tipo de conexión."""
@@ -390,11 +407,11 @@ class TabConnection(QWidget):
         self.btn_connect.setEnabled(not ok)
         self.btn_disconnect.setEnabled(ok)
         if ok:
-            self.lbl_status.setText(f"CONECTADO MODBUS · {msg}")
+            self.lbl_status.setText(f"✅ CONECTADO · {msg}")
             self.lbl_status.setStyleSheet("color: #27ae60; font-size: 13px; padding: 8px; font-weight: bold;")
         else:
-            self.lbl_status.setText("Sin conexión")
-            self.lbl_status.setStyleSheet("color: #555; font-size: 13px; padding: 8px;")
+            self.lbl_status.setText(f"❌ Sin conexión · {msg}" if msg else "Sin conexión")
+            self.lbl_status.setStyleSheet("color: #e74c3c; font-size: 13px; padding: 8px;")
 
     def log(self, text: str, color: str = None):
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -1892,11 +1909,12 @@ class TabAPI(QWidget):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ModbusMonitorThread(QThread):
-    data_received = pyqtSignal(object)       # ModbusStatus
+    data_received = pyqtSignal(object)  # ModbusStatus
     error_occurred = pyqtSignal(str)
     latency_update = pyqtSignal(float)
-    settings_received = pyqtSignal(object)   # ModbusSettings
-    info_received = pyqtSignal(object)       # ModbusInfo
+    settings_received = pyqtSignal(object)  # ModbusSettings
+    info_received = pyqtSignal(object) # ModbusInfo
+    connection_lost = pyqtSignal()  # Se perdió la conexión
 
     def __init__(self, conn, interval: float = 3.0):
         super().__init__()
@@ -1904,6 +1922,8 @@ class ModbusMonitorThread(QThread):
         self.interval = interval
         self._running = False
         self._poll_counter = 0
+        self._error_count = 0
+        self._MAX_CONSECUTIVE_ERRORS = 5
 
     def run(self):
         self._running = True
@@ -1917,14 +1937,31 @@ class ModbusMonitorThread(QThread):
 
     def _poll(self):
         start_time = time.perf_counter()
-        status = self.conn.read_status()
+        try:
+            status = self.conn.read_status()
+        except Exception as e:
+            self._error_count += 1
+            self.error_occurred.emit(f"Error de comunicación: {e}")
+            if self._error_count >= self._MAX_CONSECUTIVE_ERRORS:
+                self.connection_lost.emit()
+                self._running = False
+            return
+
         latency_ms = (time.perf_counter() - start_time) * 1000
         self.latency_update.emit(round(latency_ms, 1))
 
         if status is None:
-            self.error_occurred.emit("Sin respuesta del inversor (timeout)")
+            self._error_count += 1
+            self.error_occurred.emit(
+                f"Sin respuesta del inversor (timeout) [{self._error_count}]"
+            )
+            if self._error_count >= self._MAX_CONSECUTIVE_ERRORS:
+                self.connection_lost.emit()
+                self._running = False
             return
 
+        # Datos recibidos OK — resetear contador de errores
+        self._error_count = 0
         self.data_received.emit(status)
 
         self._poll_counter += 1
@@ -2001,31 +2038,61 @@ class MainWindow(QMainWindow):
 
     def _on_connect(self, conn_type: str, config: dict):
         """Conecta al inversor via RS232 o TCP/IP según corresponda."""
-        if conn_type == "tcp":
-            host = config.get('host', '')
-            port = config.get('port', 502)
-            timeout = config.get('timeout', 5.0)
-            if not host:
-                return
-            self._conn = ModbusTCPConnection(host, port, timeout)
-        else:
-            port = config.get('port', '')
-            if not port or port == "(sin puertos)":
-                return
-            # ModbusConnection necesita port como primer arg y el resto como config
-            serial_config = {k: v for k, v in config.items() if k != 'port'}
-            self._conn = ModbusConnection(port, serial_config)
+        if self._conn or self._monitor:
+            self.tab_conn.log("⚠ Ya hay una conexión activa — desconectá primero", '#f39c12')
+            return
 
-        ok, msg = self._conn.connect()
-        self.tab_conn.set_connected(ok, msg)
-        self.tab_conn.log(msg, '#27ae60' if ok else '#e74c3c')
-        self.statusBar().showMessage(f"{'Conectado' if ok else 'Error'}: {msg}")
+        # Deshabilitar botón conectar mientras se intenta la conexión
+        self.tab_conn.btn_connect.setEnabled(False)
+        self.tab_conn.btn_connect.setText("Conectando...")
+        QApplication.processEvents()
 
-        if ok:
-            self.tab_control.set_connection(self._conn)
-            self.tab_scanner.set_connection(self._conn)
-            self._start_monitor()
-            self._read_settings()
+        try:
+            if conn_type == "tcp":
+                host = config.get('host', '')
+                port = config.get('port', 502)
+                timeout = config.get('timeout', 5.0)
+                if not host:
+                    self.tab_conn.log("⚠ Dirección IP vacía", '#f39c12')
+                    self.tab_conn.btn_connect.setEnabled(True)
+                    self.tab_conn.btn_connect.setText("Conectar Modbus")
+                    return
+                self.tab_conn.log(f"Conectando a {host}:{port} (TCP)...", '#3498db')
+                self.statusBar().showMessage(f"Conectando a {host}:{port}...")
+                self._conn = ModbusTCPConnection(host, port, timeout)
+            else:
+                port = config.get('port', '')
+                if not port or port == "(sin puertos)":
+                    self.tab_conn.log("⚠ No hay puerto serial seleccionado", '#f39c12')
+                    self.tab_conn.btn_connect.setEnabled(True)
+                    self.tab_conn.btn_connect.setText("Conectar Modbus")
+                    return
+                serial_config = {k: v for k, v in config.items() if k != 'port'}
+                baud = serial_config.get('baudrate', 2400)
+                self.tab_conn.log(f"Conectando a {port} @ {baud} baud (RS232)...", '#3498db')
+                self.statusBar().showMessage(f"Conectando a {port}...")
+                self._conn = ModbusConnection(port, serial_config)
+
+            ok, msg = self._conn.connect()
+            self.tab_conn.set_connected(ok, msg)
+            self.tab_conn.log(msg, '#27ae60' if ok else '#e74c3c')
+            self.statusBar().showMessage(f"{'✅ Conectado' if ok else '❌ Error'}: {msg}")
+
+            if ok:
+                self.tab_conn.log("Iniciando monitoreo en tiempo real...", '#3498db')
+                self.tab_control.set_connection(self._conn)
+                self.tab_scanner.set_connection(self._conn)
+                self._start_monitor()
+                self._read_settings()
+            else:
+                self._conn = None
+                self.tab_conn.btn_connect.setEnabled(True)
+                self.tab_conn.btn_connect.setText("Conectar Modbus")
+        except Exception as e:
+            self.tab_conn.log(f"⚠ Error inesperado: {e}", '#e74c3c')
+            self._conn = None
+            self.tab_conn.btn_connect.setEnabled(True)
+            self.tab_conn.btn_connect.setText("Conectar Modbus")
 
     def _on_disconnect(self):
         self._stop_monitor()
@@ -2033,10 +2100,12 @@ class MainWindow(QMainWindow):
             self._conn.disconnect()
             self._conn = None
         self.tab_conn.set_connected(False)
+        self.tab_conn.btn_connect.setEnabled(True)
+        self.tab_conn.btn_connect.setText("Conectar Modbus")
         self.tab_conn.log("Desconectado", '#f39c12')
         self.tab_control.set_connection(None)
         self.tab_scanner.set_connection(None)
-        self.statusBar().showMessage("Desconectado")
+        self.statusBar().showMessage("Desconectado · Modbus RTU")
 
     def _start_monitor(self):
         if self._monitor:
@@ -2045,14 +2114,17 @@ class MainWindow(QMainWindow):
         self._monitor = ModbusMonitorThread(self._conn, float(interval))
         self._monitor.data_received.connect(self._on_data)
         self._monitor.error_occurred.connect(
-            lambda e: self.tab_conn.log(f"Error: {e}", '#e74c3c')
+            lambda e: self.tab_conn.log(f"⚠ {e}", '#e74c3c')
         )
         self._monitor.latency_update.connect(self.tab_monitor.update_latency)
         self._monitor.settings_received.connect(self.tab_settings.update_settings)
         self._monitor.settings_received.connect(self.tab_control.update_from_settings)
         self._monitor.settings_received.connect(self.tab_monitor.update_settings_display)
         self._monitor.info_received.connect(self.tab_monitor.update_info)
+        self._monitor.connection_lost.connect(self._on_connection_lost)
         self._monitor.start()
+        conn_type = "TCP" if isinstance(self._conn, ModbusTCPConnection) else "RS232"
+        self.tab_conn.log(f"✓ Monitoreo iniciado ({conn_type}, cada {interval:.1f}s)", '#27ae60')
 
     def _stop_monitor(self):
         if self._monitor:
@@ -2062,11 +2134,26 @@ class MainWindow(QMainWindow):
     def _on_data(self, status: ModbusStatus):
         self.tab_monitor.update_data(status)
         self.tab_api.update_data(status)
+        conn_type = "TCP" if isinstance(self._conn, ModbusTCPConnection) else "RS232"
         self.statusBar().showMessage(
-            f"OK · Bat {status.battery_voltage}V · "
+            f"✅ Conectado ({conn_type}) · Bat {status.battery_voltage}V · "
             f"PV {status.pv_power}W · Carga {status.load_percent}% · "
             f"Modo: {status.working_mode}"
         )
+
+    def _on_connection_lost(self):
+        """Se perdió la conexión tras errores consecutivos."""
+        self._monitor = None
+        if self._conn:
+            self._conn.disconnect()
+            self._conn = None
+        self.tab_conn.set_connected(False)
+        self.tab_conn.btn_connect.setEnabled(True)
+        self.tab_conn.btn_connect.setText("Conectar Modbus")
+        self.tab_conn.log("❌ Conexión perdida — demasiados errores consecutivos", '#e74c3c')
+        self.tab_control.set_connection(None)
+        self.tab_scanner.set_connection(None)
+        self.statusBar().showMessage("❌ Conexión perdida · Modbus RTU")
 
     def _read_settings(self):
         if not self._conn or not self._conn.is_open:
