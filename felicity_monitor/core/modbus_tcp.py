@@ -1,11 +1,17 @@
 """
-modbus_tcp.py — Transporte Modbus RTU sobre TCP/IP
-================================================================
-Para usar con gateways RS232→TCP (USR-TCP232, Moxa NPort, etc.)
-El frame Modbus es IDÉNTICO al RTU serial, solo cambia el transporte.
-El gateway encapsula los bytes transparentemente por TCP.
+modbus_tcp.py — Transporte Modbus sobre TCP/IP
+===============================================================
+Para usar con gateways RS485→TCP (USR-TCP232, Moxa NPort, etc).
+
+Dos framings soportados:
+  - "mbap" (por defecto): Modbus TCP estándar. Trama MBAP de 7 bytes
+    (txid + protocol id + length + unit id) + PDU, SIN CRC.
+  - "rtu": trama RTU cruda (unit + PDU + CRC) tunelada por TCP.
+
+La interfaz es compatible con ModbusConnection (felicity_modbus.py).
 """
 
+import logging
 import socket
 import time
 from typing import Optional
@@ -15,34 +21,35 @@ from core.felicity_modbus import (
     ModbusSettings,
     ModbusInfo,
     WriteResult,
-    ModbusConnection as _ModbusRTUConnection,
+    OutputPriority,
+    ChargePriority,
+    WorkingMode,
+    ChargeMode,
     calculate_crc,
     verify_crc,
-    SLAVE_ADDRESS,
     FUNCTION_READ_HOLDING,
     FUNCTION_WRITE_SINGLE,
-    STATUS_START,
-    STATUS_COUNT,
-    SETTINGS_START,
-    SETTINGS_COUNT,
-    INFO_START,
-    INFO_COUNT,
     READ_TIMEOUT_MS,
     MAX_RETRIES,
 )
+from core.register_maps import (
+    CLASSIC_MAP,
+    RegisterMap,
+    decode_status_fields,
+    get_map,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONEXIÓN MODBUS RTU OVER TCP
+# CONEXIÓN MODBUS SOBRE TCP
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ModbusTCPConnection:
     """
-    Conexión Modbus RTU sobre TCP/IP.
-
-    Usa un gateway RS232→TCP que encapsula los frames Modbus RTU
-    de forma transparente. El frame es idéntico al serial, pero
-    en vez de pyserial mandamos los bytes por socket TCP.
+    Conexión Modbus sobre TCP/IP con framing conmutable (MBAP o RTU).
 
     Interfaz compatible con ModbusConnection (felicity_modbus.py):
       - connect() -> (bool, str)
@@ -50,20 +57,44 @@ class ModbusTCPConnection:
       - is_open -> bool
       - read_holding_registers(start, count) -> list|None
       - write_single_register(address, value) -> WriteResult
-      - read_status() -> ModbusStatus|None
-      - read_settings() -> ModbusSettings|None
+      - read_status(map=None) -> ModbusStatus|None
+      - read_settings(map=None) -> ModbusSettings|None
+      - read_info(map=None) -> ModbusInfo|None
       - set_float_voltage, set_absorb_voltage, etc.
     """
 
     DEFAULT_TCP_PORT = 502
     DEFAULT_TIMEOUT = 5.0  # segundos (TCP es más lento que serial directo)
     RECV_BUFFER_SIZE = 256
+    MAX_READ_BLOCK = 60    # máximo de registros por petición
 
-    def __init__(self, host: str, port: int = None, timeout: float = None):
+    def __init__(
+        self,
+        host: str,
+        port: int = None,
+        timeout: float = None,
+        slave_id: int = 1,
+        framing: str = "mbap",
+    ):
         self.host = host
         self.port = port or self.DEFAULT_TCP_PORT
         self.timeout = timeout or self.DEFAULT_TIMEOUT
+        self.slave_id = slave_id
+        self.framing = self._validate_framing(framing)
+        self.map: RegisterMap = CLASSIC_MAP
         self._socket: Optional[socket.socket] = None
+        self._txid: int = 0
+
+    @staticmethod
+    def _validate_framing(framing: str) -> str:
+        framing = (framing or "mbap").lower()
+        if framing not in ("mbap", "rtu"):
+            raise ValueError(f"Framing no soportado: {framing}")
+        return framing
+
+    def set_map(self, map) -> None:
+        """Establece el mapa de registros activo para lecturas/escrituras."""
+        self.map = get_map(map)
 
     def connect(self) -> tuple[bool, str]:
         """
@@ -76,7 +107,7 @@ class ModbusTCPConnection:
             self._socket.connect((self.host, self.port))
             return True, (
                 f"Conectado a {self.host}:{self.port} "
-                f"(Modbus RTU over TCP)"
+                f"(Modbus {self.framing.upper()})"
             )
         except socket.timeout:
             self._socket = None
@@ -106,14 +137,59 @@ class ModbusTCPConnection:
         """Verifica si el socket está conectado."""
         if self._socket is None:
             return False
-        # Probe silencioso: verificar que el socket no esté roto
         try:
-            # getpeername() falla si el socket se cerró
             self._socket.getpeername()
             return True
         except OSError:
             self._socket = None
             return False
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Construcción de tramas
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _next_txid(self) -> int:
+        self._txid = (self._txid + 1) & 0xFFFF
+        return self._txid
+
+    def _frame(self, pdu: bytes) -> bytes:
+        """Envuelve un PDU según el framing activo (MBAP o RTU)."""
+        if self.framing == "mbap":
+            txid = self._next_txid()
+            header = bytes([
+                (txid >> 8) & 0xFF,
+                txid & 0xFF,
+                0x00,
+                0x00,
+                0x00,
+                len(pdu) + 1,
+            ])
+            return header + bytes([self.slave_id]) + pdu
+
+        payload = bytes([self.slave_id]) + pdu
+        return payload + calculate_crc(payload)
+
+    def _build_read_frame(self, start_address: int, count: int) -> bytes:
+        """Construye la trama de lectura de holding (función 0x03)."""
+        pdu = bytes([
+            FUNCTION_READ_HOLDING,
+            (start_address >> 8) & 0xFF,
+            start_address & 0xFF,
+            (count >> 8) & 0xFF,
+            count & 0xFF,
+        ])
+        return self._frame(pdu)
+
+    def _build_write_frame(self, register_address: int, value: int) -> bytes:
+        """Construye la trama de escritura de un registro (función 0x06)."""
+        pdu = bytes([
+            FUNCTION_WRITE_SINGLE,
+            (register_address >> 8) & 0xFF,
+            register_address & 0xFF,
+            (value >> 8) & 0xFF,
+            value & 0xFF,
+        ])
+        return self._frame(pdu)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Lectura de registros
@@ -122,11 +198,7 @@ class ModbusTCPConnection:
     def read_holding_registers(self, start_address: int, count: int) -> Optional[list]:
         """
         Lee registros holding via TCP.
-        Función 0x03 del protocolo Modbus — idéntico al RTU serial.
-
-        Args:
-            start_address: Dirección inicial (ej: 0x1101)
-            count: Cantidad de registros a leer
+        Función 0x03 del protocolo Modbus.
 
         Returns:
             Lista de valores (int), o None si falla
@@ -136,58 +208,26 @@ class ModbusTCPConnection:
 
         for attempt in range(MAX_RETRIES):
             try:
-                # Construir trama — IDÉNTICA al Modbus RTU serial
-                frame = bytearray([
-                    SLAVE_ADDRESS,
-                    FUNCTION_READ_HOLDING,
-                    (start_address >> 8) & 0xFF,
-                    start_address & 0xFF,
-                    (count >> 8) & 0xFF,
-                    count & 0xFF,
-                ])
-                crc = calculate_crc(bytes(frame))
-                frame.extend(crc)
-
-                # Enviar por TCP
+                frame = self._build_read_frame(start_address, count)
                 self._socket.sendall(bytes(frame))
 
-                # Leer respuesta
                 response = self._read_response(count)
-
                 if response is None:
                     continue
 
-                # Verificar slave ID y function code
-                if response[0] != SLAVE_ADDRESS:
-                    continue
-
-                # Verificar Modbus exception
-                if response[1] & 0x80:
-                    return None
-
-                # Verificar que tenemos suficientes bytes
-                byte_count = response[2]
-                expected = 3 + byte_count + 2  # header + data + crc
-
-                if len(response) < expected:
-                    continue
-
-                # Parsear registros (big-endian: MSB first)
-                registers = []
-                for i in range(count):
-                    offset = 3 + (i * 2)
-                    if offset + 1 < len(response):
-                        value = (response[offset] << 8) | response[offset + 1]
-                        registers.append(value)
-
-                if len(registers) == count:
+                registers = self._parse_read_response(response, count)
+                if registers is not None:
                     return registers
 
             except (socket.timeout, OSError):
-                # Reintentar — TCP puede tener latencia variable
                 continue
 
         return None
+
+    def _expected_read_bytes(self, count: int) -> int:
+        if self.framing == "mbap":
+            return 9 + (count * 2)  # MBAP(7) + func(1) + bytecount(1) + data
+        return 5 + (count * 2)      # unit(1) + func(1) + bytecount(1) + data + crc(2)
 
     def _read_response(self, expected_count: int) -> Optional[bytes]:
         """
@@ -197,7 +237,7 @@ class ModbusTCPConnection:
         if not self._socket:
             return None
 
-        expected_bytes = 3 + (expected_count * 2) + 2  # header + data + crc
+        expected_bytes = self._expected_read_bytes(expected_count)
         buffer = bytearray()
         start_time = time.perf_counter()
 
@@ -214,7 +254,6 @@ class ModbusTCPConnection:
                 if chunk:
                     buffer.extend(chunk)
                 else:
-                    # Conexión cerrada por el gateway
                     return None
             except socket.timeout:
                 if len(buffer) >= 5:
@@ -225,6 +264,49 @@ class ModbusTCPConnection:
 
         return bytes(buffer) if buffer else None
 
+    def _parse_read_response(self, response: bytes, count: int) -> Optional[list]:
+        """Interpreta una respuesta de lectura según el framing activo."""
+        if not response:
+            return None
+
+        if self.framing == "mbap":
+            if len(response) < 9:
+                return None
+            if response[2:4] != b"\x00\x00":
+                return None
+            if response[6] != self.slave_id:
+                return None
+            pdu = response[7:]
+            if len(pdu) < 2 or pdu[0] != FUNCTION_READ_HOLDING:
+                return None
+            if pdu[0] & 0x80:
+                return None
+            byte_count = pdu[1]
+            data = pdu[2:2 + byte_count]
+        else:
+            if len(response) < 5:
+                return None
+            if response[0] != self.slave_id:
+                return None
+            if not verify_crc(response):
+                logger.warning("Respuesta RTU con CRC inválido")
+                return None
+            if response[1] != FUNCTION_READ_HOLDING:
+                return None
+            if response[1] & 0x80:
+                return None
+            byte_count = response[2]
+            data = response[3:3 + byte_count]
+
+        if len(data) < count * 2:
+            return None
+
+        registers = []
+        for i in range(count):
+            offset = i * 2
+            registers.append((data[offset] << 8) | data[offset + 1])
+        return registers
+
     # ─────────────────────────────────────────────────────────────────────────
     # Escritura de registro
     # ─────────────────────────────────────────────────────────────────────────
@@ -232,33 +314,31 @@ class ModbusTCPConnection:
     def write_single_register(self, register_address: int, value: int) -> WriteResult:
         """
         Escribe un solo registro via TCP.
-        Función 0x06 del protocolo Modbus — idéntico al RTU serial.
+        Función 0x06 del protocolo Modbus.
 
         Returns: WriteResult con éxito o error
         """
         if not self.is_open:
             return WriteResult(False, register_address, value, 0.0, "No conectado")
 
+        if self.map is not None and self.map.settings_start is None:
+            logger.warning(
+                "mapa sin bloque de ajustes: no se puede escribir en %s",
+                self.map.label,
+            )
+            return WriteResult(
+                False, register_address, value, 0.0,
+                "mapa sin bloque de ajustes",
+            )
+
         start_time = time.perf_counter()
 
         try:
-            # Construir trama — IDÉNTICA al Modbus RTU serial
-            frame = bytearray([
-                SLAVE_ADDRESS,
-                FUNCTION_WRITE_SINGLE,
-                (register_address >> 8) & 0xFF,
-                register_address & 0xFF,
-                (value >> 8) & 0xFF,
-                value & 0xFF,
-            ])
-            crc = calculate_crc(bytes(frame))
-            frame.extend(crc)
-
-            # Enviar por TCP
+            frame = self._build_write_frame(register_address, value)
             self._socket.sendall(bytes(frame))
 
-            # Leer respuesta (8 bytes esperados)
-            response = self._recv_exact(8)
+            expected = 12 if self.framing == "mbap" else 8
+            response = self._recv_exact(expected)
 
             latency = (time.perf_counter() - start_time) * 1000
 
@@ -268,18 +348,41 @@ class ModbusTCPConnection:
                     "Sin respuesta del gateway"
                 )
 
-            # Verificar que sea echo del request
-            if (response[0] == SLAVE_ADDRESS
-                    and response[1] == FUNCTION_WRITE_SINGLE):
-                return WriteResult(True, register_address, value, latency)
+            if self.framing == "mbap":
+                if response[6] != self.slave_id:
+                    return WriteResult(
+                        False, register_address, value, latency,
+                        "Slave ID no coincide"
+                    )
+                if response[7] == FUNCTION_WRITE_SINGLE:
+                    return WriteResult(True, register_address, value, latency)
+                if response[7] & 0x80:
+                    return WriteResult(
+                        False, register_address, value, latency,
+                        f"Excepción Modbus: código {response[9]}"
+                    )
+                return WriteResult(
+                    False, register_address, value, latency,
+                    "Respuesta inesperada"
+                )
 
-            # Verificar exception
+            if not verify_crc(response):
+                return WriteResult(
+                    False, register_address, value, latency,
+                    "CRC inválido"
+                )
+            if response[0] != self.slave_id:
+                return WriteResult(
+                    False, register_address, value, latency,
+                    "Slave ID no coincide"
+                )
+            if response[1] == FUNCTION_WRITE_SINGLE:
+                return WriteResult(True, register_address, value, latency)
             if response[1] & 0x80:
                 return WriteResult(
                     False, register_address, value, latency,
                     f"Excepción Modbus: código {response[2]}"
                 )
-
             return WriteResult(
                 False, register_address, value, latency,
                 "Respuesta inesperada"
@@ -318,95 +421,95 @@ class ModbusTCPConnection:
     # Operaciones de alto nivel — mismas que ModbusConnection RTU
     # ─────────────────────────────────────────────────────────────────────────
 
-    def read_status(self) -> Optional[ModbusStatus]:
+    def _read_status_registers(self, map_obj: RegisterMap) -> Optional[list]:
+        """Lee el bloque de estado completo, partiéndolo en bloques <= 60."""
+        registers: list = []
+        addr = map_obj.status_start
+        remaining = map_obj.status_count
+
+        while remaining > 0:
+            chunk = min(self.MAX_READ_BLOCK, remaining)
+            regs = self.read_holding_registers(addr, chunk)
+            if regs is None or len(regs) < chunk:
+                return None
+            registers.extend(regs)
+            addr += chunk
+            remaining -= chunk
+
+        return registers
+
+    def read_status(self, map=None) -> Optional[ModbusStatus]:
         """
         Lee el estado actual del inversor via TCP.
-        Lee los registros 0x1100 - 0x112A (43 registros).
-        Parsing idéntico a ModbusConnection RTU (felicity_modbus.py).
+        Decodifica según el mapa indicado (por defecto, el mapa activo).
         """
-        # Leemos desde 0x1100 para incluir SettingDataSn
-        regs = self.read_holding_registers(STATUS_START - 1, STATUS_COUNT + 1)
+        map_obj = get_map(map) if map is not None else (self.map or CLASSIC_MAP)
+        if map is not None:
+            self.map = map_obj
 
-        if regs is None or len(regs) < STATUS_COUNT + 1:
-            # Fallback: intentar sin 0x1100
-            regs = self.read_holding_registers(STATUS_START, STATUS_COUNT)
-            if regs is None or len(regs) < STATUS_COUNT:
-                return None
-            regs = [0] + regs  # prepend dummy para 0x1100
+        regs = self._read_status_registers(map_obj)
+        if regs is None:
+            return None
+
+        decoded = decode_status_fields(regs, map_obj.status_start, map_obj)
 
         status = ModbusStatus()
         status.raw_registers = list(regs)
+        status.map_name = map_obj.name
 
-        # Offset 0 (0x1100): SettingDataSn
-        status.setting_data_sn = regs[0]
+        status.setting_data_sn = int(decoded.get("setting_data_sn", 0))
+        status.working_mode = WorkingMode.from_int(int(decoded.get("working_mode", 0)))
+        status.charge_mode = ChargeMode.from_int(int(decoded.get("charge_mode", 0)))
+        status.fault_code = int(decoded.get("fault_code", 0))
+        status.power_flow_raw = int(decoded.get("power_flow", 0))
 
-        # Offset 1 (0x1101): Working mode
-        status.working_mode = _parse_working_mode(regs[1])
+        status.battery_voltage = round(float(decoded.get("battery_voltage", 0.0)), 1)
 
-        # Offset 2 (0x1102): Charge mode
-        status.charge_mode = _parse_charge_mode(regs[2])
-
-        # Offset 3 (0x1103): Fault code
-        status.fault_code = regs[3]
-
-        # Offset 4 (0x1104): PowerFlowMsg
-        status.power_flow_raw = regs[4]
-
-        # Offset 8 (0x1108): Battery voltage / 100
-        status.battery_voltage = round(regs[8] / 100.0, 1)
-
-        # Offset 9 (0x1109): Battery current (signed)
-        current = _signed_value(regs[9])
+        current = float(decoded.get("battery_current", 0.0))
         status.battery_current = current
         if current < 0:
             status.battery_discharge_a = abs(current)
         else:
             status.battery_charge_a = current
 
-        # Offset 10 (0x110A): Battery power (signed)
-        power = _signed_value(regs[10])
-        status.battery_power = power
+        power = float(decoded.get("battery_power", 0.0))
+        status.battery_power = int(power)
         if power < 0:
-            status.battery_discharge_w = abs(power)
+            status.battery_discharge_w = abs(int(power))
         else:
-            status.battery_charge_w = power
+            status.battery_charge_w = int(power)
 
-        # Offset 17 (0x1111): AC Output voltage / 10
-        status.output_voltage = round(regs[17] / 10.0, 1)
+        if "battery_soc" in decoded:
+            status.battery_soc = int(round(decoded["battery_soc"]))
 
-        # Offset 23 (0x1117): Grid voltage / 10
-        status.grid_voltage = round(regs[23] / 10.0, 1)
-
-        # Offset 25 (0x1119): AC input frequency / 100
-        status.grid_frequency = round(regs[25] / 100.0, 2)
-
-        # Offset 30 (0x111E): Output active power (signed)
-        status.output_active_power = _signed_value(regs[30])
+        status.output_voltage = round(float(decoded.get("output_voltage", 0.0)), 1)
+        status.grid_voltage = round(float(decoded.get("grid_voltage", 0.0)), 1)
+        status.grid_frequency = round(float(decoded.get("grid_frequency", 0.0)), 2)
+        status.output_active_power = int(decoded.get("output_active_power", 0))
         status.load_watts = status.output_active_power
-
-        # Offset 31 (0x111F): Output apparent power
-        status.output_apparent_power = regs[31]
-
-        # Offset 32 (0x1120): Load percent
-        status.load_percent = regs[32]
-
-        # Offset 38 (0x1126): PV voltage / 10
-        status.pv_voltage = round(regs[38] / 10.0, 1)
-
-        # Offset 42 (0x112A): PV power (signed)
-        status.pv_power = _signed_value(regs[42])
+        status.output_apparent_power = int(decoded.get("output_apparent_power", 0))
+        status.load_percent = int(decoded.get("load_percent", 0))
+        status.pv_voltage = round(float(decoded.get("pv_voltage", 0.0)), 1)
+        status.pv_power = int(decoded.get("pv_power", 0))
 
         return status
 
-    def read_settings(self) -> Optional[ModbusSettings]:
+    def read_settings(self, map=None) -> Optional[ModbusSettings]:
         """
         Lee la configuración del inversor via TCP.
-        Lee los registros 0x211F - 0x2159 (59 registros).
-        Parsing idéntico a ModbusConnection RTU (felicity_modbus.py).
+        Si el mapa no tiene bloque de ajustes, devuelve None con advertencia.
         """
-        regs = self.read_holding_registers(SETTINGS_START, SETTINGS_COUNT)
+        map_obj = get_map(map) if map is not None else (self.map or CLASSIC_MAP)
+        if map is not None:
+            self.map = map_obj
 
-        if regs is None or len(regs) < SETTINGS_COUNT:
+        if map_obj.settings_start is None or map_obj.settings_count <= 0:
+            logger.warning("mapa sin bloque de ajustes: %s", map_obj.label)
+            return None
+
+        regs = self.read_holding_registers(map_obj.settings_start, map_obj.settings_count)
+
+        if regs is None or len(regs) < map_obj.settings_count:
             return None
 
         settings = ModbusSettings()
@@ -425,7 +528,6 @@ class ModbusTCPConnection:
         settings.ac_output_frequency = regs[10]
 
         # Offset 11 (0x212A): Output priority
-        from core.felicity_modbus import OutputPriority, ChargePriority
         try:
             settings.output_priority = OutputPriority(regs[11])
         except ValueError:
@@ -472,15 +574,22 @@ class ModbusTCPConnection:
 
         return settings
 
-    def read_info(self) -> Optional['ModbusInfo']:
+    def read_info(self, map=None) -> Optional['ModbusInfo']:
         """
         Lee la información del equipo via TCP.
-        Registros 0xF800 - 0xF80C (13 registros).
-        Parsing idéntico a ModbusConnection RTU (felicity_modbus.py).
+        Si el mapa no tiene bloque de información, devuelve None.
         """
-        regs = self.read_holding_registers(INFO_START, INFO_COUNT)
+        map_obj = get_map(map) if map is not None else (self.map or CLASSIC_MAP)
+        if map is not None:
+            self.map = map_obj
 
-        if regs is None or len(regs) < INFO_COUNT:
+        if map_obj.info_start is None or map_obj.info_count <= 0:
+            logger.warning("mapa sin bloque de información: %s", map_obj.label)
+            return None
+
+        regs = self.read_holding_registers(map_obj.info_start, map_obj.info_count)
+
+        if regs is None or len(regs) < map_obj.info_count:
             return None
 
         info = ModbusInfo()
@@ -532,11 +641,9 @@ class ModbusTCPConnection:
         return self.write_single_register(0x2159, value)
 
     def set_output_priority(self, priority) -> WriteResult:
-        from core.felicity_modbus import OutputPriority
         return self.write_single_register(0x212A, priority.value)
 
     def set_charge_priority(self, priority) -> WriteResult:
-        from core.felicity_modbus import ChargePriority
         return self.write_single_register(0x212C, priority.value)
 
     def set_max_charge_current(self, current: int) -> WriteResult:
@@ -544,27 +651,3 @@ class ModbusTCPConnection:
 
     def set_max_ac_charge_current(self, current: int) -> WriteResult:
         return self.write_single_register(0x2130, current)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# FUNCIONES AUXILIARES (duplicadas de felicity_modbus para evitar
-# dependencia circular en los imports)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _signed_value(value: int) -> int:
-    """Convierte un valor unsigned de 16 bits a signed."""
-    if value >= 0x8000:
-        return value - 0x10000
-    return value
-
-
-def _parse_working_mode(value: int):
-    """Parsea modo de trabajo desde registro raw."""
-    from core.felicity_modbus import WorkingMode
-    return WorkingMode.from_int(value)
-
-
-def _parse_charge_mode(value: int):
-    """Parsea modo de carga desde registro raw."""
-    from core.felicity_modbus import ChargeMode
-    return ChargeMode.from_int(value)

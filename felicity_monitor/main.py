@@ -41,6 +41,7 @@ from core.felicity_modbus import (
 from core.modbus_tcp import ModbusTCPConnection
 from core.profiles import ProfileManager
 from core.tab_profiles import TabProfiles
+from core.multi_inverter import InverterStatus
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -187,23 +188,36 @@ class TabConnection(QWidget):
     connect_requested = pyqtSignal(str, dict)
     disconnect_requested = pyqtSignal()
     autodetect_requested = pyqtSignal(str)
+    multi_config_changed = pyqtSignal(bool)  # enabled True/False
 
     def __init__(self):
         super().__init__()
         self._build_ui()
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
         layout.setSpacing(12)
+        layout.setContentsMargins(10, 10, 10, 10)
 
         grp_info = QGroupBox("Protocolo Modbus RTU")
         info_layout = QVBoxLayout(grp_info)
         lbl_info = QLabel(
             "Protocolo basado en Felicity-Inverter-Monitor (C#)\n"
-            "• Dirección esclavo: 0x01\n"
-            "• Registros estado: 0x1101-0x112A (42 regs)\n"
-            "• Registros config: 0x211F-0x2159 (59 regs)\n"
-            "• Funciones: Read Holding (0x03), Write Single (0x06)"
+            "• Dirección esclavo: configurable (1-247, por defecto 1)\n"
+            "• Mapa clásico: estado 0x1100-0x112A, config 0x211F-0x2159\n"
+            "• Mapa IVGM-8K: estado 0x1100-0x1177 (Series RS485)\n"
+            "• Funciones: Read Holding (0x03), Write Single (0x06)\n"
+            "• Framing TCP: Modbus TCP (MBAP) o RTU tunnelled"
         )
         lbl_info.setStyleSheet("color:#888; font-size:11px; font-family: 'Courier New';")
         info_layout.addWidget(lbl_info)
@@ -214,7 +228,7 @@ class TabConnection(QWidget):
         gt = QHBoxLayout(grp_type)
         self.cb_conn_type = QComboBox()
         self.cb_conn_type.addItem("RS232 — Puerto serie (COM)", "serial")
-        self.cb_conn_type.addItem("TCP/IP — Gateway RS232→TCP", "tcp")
+        self.cb_conn_type.addItem("TCP/IP — Gateway RS232/RS485→TCP", "tcp")
         self.cb_conn_type.currentIndexChanged.connect(self._on_type_changed)
         gt.addWidget(self.cb_conn_type)
         layout.addWidget(grp_type)
@@ -260,7 +274,7 @@ class TabConnection(QWidget):
         stack_layout.addWidget(self.grp_serial)
 
         # --- Panel TCP/IP ---
-        self.grp_tcp = QGroupBox("Configuración TCP/IP (Gateway RS232→TCP)")
+        self.grp_tcp = QGroupBox("Configuración TCP/IP (Gateway RS232/RS485→TCP)")
         gtcp = QGridLayout(self.grp_tcp)
 
         gtcp.addWidget(QLabel("Host / IP:"), 0, 0)
@@ -282,16 +296,104 @@ class TabConnection(QWidget):
         self.sp_tcp_timeout.setSingleStep(0.5)
         gtcp.addWidget(self.sp_tcp_timeout, 2, 1)
 
+        gtcp.addWidget(QLabel("Framing:"), 3, 0)
+        self.cb_framing = QComboBox()
+        self.cb_framing.addItem("Modbus TCP (MBAP) — conversores de campo", "mbap")
+        self.cb_framing.addItem("RTU tunnelled — gateway transparente", "rtu")
+        self.cb_framing.setToolTip(
+            "MBAP: el gateway recibe Modbus TCP con cabecera MBAP\n"
+            "(modo 'Modbus TCP To RTU' de Waveshare/USR/Moxa).\n"
+            "RTU: el gateway pasa los bytes RTU crudos (modo transparente)."
+        )
+        gtcp.addWidget(self.cb_framing, 3, 1)
+
+        gtcp.addWidget(QLabel("Slave ID:"), 4, 0)
+        self.sp_slave_id = QSpinBox()
+        self.sp_slave_id.setRange(1, 247)
+        self.sp_slave_id.setValue(1)
+        self.sp_slave_id.setToolTip("ID Modbus del inversor (1-247)")
+        gtcp.addWidget(self.sp_slave_id, 4, 1)
+
         lbl_tcp_note = QLabel(
-            "Usá un gateway RS232→TCP (USR-TCP232, Moxa NPort, etc.)\n"
-            "El gateway encapsula los frames Modbus RTU por TCP de forma transparente."
+            "Usá un gateway RS232/RS485→TCP (Waveshare, USR-TCP232, Moxa NPort, etc.)\n"
+            "MBAP: el gateway opera en 'Modbus TCP To RTU' (8N1, 9600 para IVGM).\n"
+            "RTU: el gateway opera en modo transparente / passthrough."
         )
         lbl_tcp_note.setStyleSheet("color:#888; font-size:10px;")
-        gtcp.addWidget(lbl_tcp_note, 3, 0, 1, 2)
+        gtcp.addWidget(lbl_tcp_note, 5, 0, 1, 2)
 
         stack_layout.addWidget(self.grp_tcp)
 
         layout.addWidget(self.config_stack)
+
+        # ── Configuración Multi-Inversor ──
+        self.grp_multi = QGroupBox("Sistema Multi-Inversor (Paralelo)")
+        gm = QVBoxLayout(self.grp_multi)
+
+        self.chk_multi_enabled = QCheckBox("Habilitar modo multi-inversor")
+        self.chk_multi_enabled.setToolTip(
+            "Consulta N inversores en paralelo cambiando el ID Modbus en cada petición.\n"
+            "Cada inversor puede tener su propio mapa de registros."
+        )
+        self.chk_multi_enabled.toggled.connect(self._on_multi_toggled)
+        gm.addWidget(self.chk_multi_enabled)
+
+        # Tabla de inversores: slave_id + etiqueta + mapa
+        self.tbl_inverters = QTableWidget(0, 3)
+        self.tbl_inverters.setHorizontalHeaderLabels(
+            ["Slave ID", "Etiqueta", "Modelo / Mapa"]
+        )
+        self.tbl_inverters.horizontalHeader().setStretchLastSection(True)
+        self.tbl_inverters.setMaximumHeight(110)
+        self.tbl_inverters.setToolTip(
+            "Cada fila es un inversor del bus. El mapa define cómo se "
+            "interpretan sus registros."
+        )
+        gm.addWidget(self.tbl_inverters)
+
+        row_inv_btns = QHBoxLayout()
+        self.btn_add_inv = QPushButton("+ Agregar inversor")
+        self.btn_add_inv.clicked.connect(self._add_inverter_row)
+        self.btn_del_inv = QPushButton("- Quitar seleccionado")
+        self.btn_del_inv.clicked.connect(self._remove_inverter_row)
+        row_inv_btns.addWidget(self.btn_add_inv)
+        row_inv_btns.addWidget(self.btn_del_inv)
+        row_inv_btns.addStretch()
+        gm.addLayout(row_inv_btns)
+
+        gm.addWidget(QLabel("Timeout por ID (ms):"))
+        self.sp_multi_timeout = QSpinBox()
+        self.sp_multi_timeout.setRange(100, 5000)
+        self.sp_multi_timeout.setValue(800)
+        self.sp_multi_timeout.setSingleStep(100)
+        self.sp_multi_timeout.setToolTip(
+            "Milisegundos de espera por cada respuesta individual"
+        )
+        gm.addWidget(self.sp_multi_timeout)
+
+        gm.addWidget(QLabel("Intervalo de polling (s):"))
+        self.sp_multi_interval = QDoubleSpinBox()
+        self.sp_multi_interval.setRange(1.0, 30.0)
+        self.sp_multi_interval.setValue(5.0)
+        self.sp_multi_interval.setSingleStep(0.5)
+        self.sp_multi_interval.setToolTip(
+            "Segundos entre ciclos completos de lectura de todos los inversores"
+        )
+        gm.addWidget(self.sp_multi_interval)
+
+        lbl_multi_note = QLabel(
+            "⚠ Cada inversor usa su propio mapa de registros.\n"
+            "El gateway debe reenviar peticiones Modbus a los IDs esclavos."
+        )
+        lbl_multi_note.setStyleSheet("color:#e94560; font-size:10px;")
+        gm.addWidget(lbl_multi_note)
+
+        layout.addWidget(self.grp_multi)
+
+        # Inicializar estado de controles multi-inversor
+        self._add_inverter_row(1, "5K existente", "classic")
+        self._add_inverter_row(2, "8K IVGM", "ivgm_8k")
+        self._on_multi_toggled(False)
 
         row_btns = QHBoxLayout()
         self.btn_connect = QPushButton("Conectar Modbus")
@@ -339,6 +441,11 @@ class TabConnection(QWidget):
         self.lbl_status.setStyleSheet("color: #555; font-size: 13px; padding: 8px;")
         layout.addWidget(self.lbl_status)
 
+        layout.addStretch()  # Empuja todo hacia arriba, deja espacio para el log
+
+        scroll.setWidget(container)
+        outer.addWidget(scroll)
+
         self.refresh_ports()
         # Inicializar visibilidad de paneles según tipo de conexión
         self._on_type_changed(0)
@@ -354,6 +461,75 @@ class TabConnection(QWidget):
         self.grp_tcp.setVisible(not is_serial)
         # Auto-detectar solo tiene sentido en serial
         self.btn_autodetect.setEnabled(is_serial)
+
+    def _add_inverter_row(self, slave_id: int = 1, label: str = "",
+                          map_name: str = "classic"):
+        """Agrega una fila a la tabla de inversores del bus."""
+        from core.register_maps import MAPS
+
+        row = self.tbl_inverters.rowCount()
+        self.tbl_inverters.insertRow(row)
+
+        sp_id = QSpinBox()
+        sp_id.setRange(1, 247)
+        sp_id.setValue(slave_id)
+        sp_id.setToolTip("ID Modbus del inversor")
+        self.tbl_inverters.setCellWidget(row, 0, sp_id)
+
+        le_label = QLineEdit(label)
+        le_label.setPlaceholderText("Ej: 8K IVGM")
+        self.tbl_inverters.setCellWidget(row, 1, le_label)
+
+        cb_map = QComboBox()
+        for key, mapa in MAPS.items():
+            cb_map.addItem(mapa.label, key)
+        cb_map.setCurrentIndex(max(0, cb_map.findData(map_name)))
+        cb_map.setToolTip(
+            "Mapa de registros que define cómo se interpretan los datos "
+            "de este inversor."
+        )
+        self.tbl_inverters.setCellWidget(row, 2, cb_map)
+
+    def _remove_inverter_row(self):
+        """Quita la fila seleccionada de la tabla de inversores."""
+        row = self.tbl_inverters.currentRow()
+        if row >= 0:
+            self.tbl_inverters.removeRow(row)
+
+    def _on_multi_toggled(self, checked: bool):
+        """Habilita/deshabilita los controles de multi-inversor."""
+        for w in (self.tbl_inverters, self.btn_add_inv, self.btn_del_inv,
+                  self.sp_multi_timeout, self.sp_multi_interval):
+            w.setEnabled(checked)
+        # Emitir señal para que MainWindow muestre/oculte la tab
+        self.multi_config_changed.emit(checked)
+
+    def get_multi_config(self):
+        """Retorna la configuración multi-inversor como MultiInverterConfig."""
+        from core.multi_inverter import MultiInverterConfig, InverterEntry
+
+        entries = []
+        for row in range(self.tbl_inverters.rowCount()):
+            sp_id = self.tbl_inverters.cellWidget(row, 0)
+            le_label = self.tbl_inverters.cellWidget(row, 1)
+            cb_map = self.tbl_inverters.cellWidget(row, 2)
+            if sp_id is None or cb_map is None:
+                continue
+            entries.append(InverterEntry(
+                slave_id=sp_id.value(),
+                label=le_label.text().strip() if le_label else "",
+                map_name=cb_map.currentData() or "classic",
+            ))
+
+        total = len(entries) if entries else 1
+        return MultiInverterConfig(
+            enabled=self.chk_multi_enabled.isChecked(),
+            total_inverters=total,
+            start_id=entries[0].slave_id if entries else 1,
+            poll_interval_sec=self.sp_multi_interval.value(),
+            timeout_ms=self.sp_multi_timeout.value(),
+            inverters=entries,
+        )
 
     def get_connection_type(self) -> str:
         """Retorna 'serial' o 'tcp'."""
@@ -382,6 +558,8 @@ class TabConnection(QWidget):
             'host': self.le_tcp_host.text().strip(),
             'port': self.sp_tcp_port.value(),
             'timeout': self.sp_tcp_timeout.value(),
+            'framing': self.cb_framing.currentData() or "mbap",
+            'slave_id': self.sp_slave_id.value(),
         }
 
     def _on_connect(self):
@@ -839,6 +1017,290 @@ class TabMonitor(QWidget):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TAB 2b — SISTEMA EN PARALELO (Multi-Inversor)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TabParallelSystem(QWidget):
+    """Pestaña de visualización del sistema multi-inversor en paralelo.
+
+    Muestra:
+    - Resumen global (MetricCards): potencias totales, voltaje promedio, online/total, alertas
+    - Tabla detallada por inversor con color-coding de estado
+    """
+
+    # Señal: navegar al Monitor tab para ver un inversor individual
+    navigate_to_inverter = pyqtSignal(int)  # slave_id
+
+    def __init__(self):
+        super().__init__()
+        self._build_ui()
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setSpacing(10)
+        outer.setContentsMargins(10, 10, 10, 10)
+
+        # ── Header ──
+        header_row = QHBoxLayout()
+        header = QLabel("⚡ Sistema en Paralelo")
+        header.setStyleSheet("font-size:18px; font-weight:bold; color:#e94560;")
+        header_row.addWidget(header)
+        header_row.addStretch()
+
+        self.lbl_poll_status = QLabel("—")
+        self.lbl_poll_status.setStyleSheet("color:#888; font-size:11px;")
+        header_row.addWidget(self.lbl_poll_status)
+
+        self.progress_poll = QProgressBar()
+        self.progress_poll.setMaximumWidth(200)
+        self.progress_poll.setMaximumHeight(16)
+        self.progress_poll.setTextVisible(False)
+        self.progress_poll.setVisible(False)
+        header_row.addWidget(self.progress_poll)
+
+        outer.addLayout(header_row)
+
+        # ── Sección 1: Resumen del Sistema (MetricCards) ──
+        grp_summary = QGroupBox("🔋 Resumen del Sistema")
+        gs = QVBoxLayout(grp_summary)
+        gs.setSpacing(8)
+
+        # Fila 1: Potencias
+        row1 = QHBoxLayout()
+        row1.setSpacing(8)
+        self.card_ac_power = MetricCard("⚡ Potencia AC", "W")
+        self.card_pv_power = MetricCard("☀ Potencia PV", "W")
+        self.card_bat_power = MetricCard("🔋 Pot. Batería", "W")
+        row1.addWidget(self.card_ac_power)
+        row1.addWidget(self.card_pv_power)
+        row1.addWidget(self.card_bat_power)
+        gs.addLayout(row1)
+
+        # Fila 2: Voltaje + Activos + Alertas
+        row2 = QHBoxLayout()
+        row2.setSpacing(8)
+        self.card_bat_voltage = MetricCard("🔋 V.Bat Promedio", "V")
+        self.card_online = MetricCard("🖥 Activos", "/ total")
+        self.card_alerts = self._build_alert_card()
+        row2.addWidget(self.card_bat_voltage)
+        row2.addWidget(self.card_online)
+        row2.addWidget(self.card_alerts)
+        gs.addLayout(row2)
+
+        outer.addWidget(grp_summary)
+
+        # ── Sección 2: Tabla de Inversores ──
+        grp_table = QGroupBox("📋 Detalle por Inversor")
+        gt = QVBoxLayout(grp_table)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(9)
+        self.table.setHorizontalHeaderLabels([
+            "ID", "Estado", "Modo", "V.Bat (V)",
+            "I.Bat (A)", "P.Bat (W)", "P.AC (W)",
+            "V.AC (V)", "Fallo"
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setSortingEnabled(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setMinimumHeight(200)
+        self.table.cellDoubleClicked.connect(self._on_row_double_clicked)
+
+        gt.addWidget(self.table)
+        outer.addWidget(grp_table)
+
+        # ── Leyenda ──
+        legend = QLabel(
+            "🟢 Online  ·  🟠 Advertencia  ·  🔴 Falla  ·  ⚫ Offline  |  "
+            "Doble clic en una fila → ver detalle en Monitor"
+        )
+        legend.setStyleSheet("color:#555; font-size:10px;")
+        legend.setAlignment(Qt.AlignCenter)
+        outer.addWidget(legend)
+
+        # Estado inicial vacío
+        self.table.setRowCount(0)
+
+    def _build_alert_card(self) -> QFrame:
+        """Tarjeta de alertas con lista de mensajes."""
+        frame = QFrame()
+        frame.setStyleSheet(
+            "QFrame { background: #16213e; border: 1px solid #333; border-radius: 10px; }"
+        )
+        frame.setMinimumWidth(250)
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(2)
+
+        lbl_title = QLabel("⚠ Alertas")
+        lbl_title.setStyleSheet("font-size:11px; color:#888;")
+        lbl_title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(lbl_title)
+
+        self.lbl_alerts = QLabel("—")
+        self.lbl_alerts.setStyleSheet("font-size:12px; color:#555;")
+        self.lbl_alerts.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.lbl_alerts.setWordWrap(True)
+        layout.addWidget(self.lbl_alerts)
+
+        return frame
+
+    # ── Actualización de datos ──
+
+    def update_summary(self, summary):
+        """Actualiza las MetricCards con el resumen del sistema."""
+        from core.multi_inverter import SystemSummary
+        self.card_ac_power.update(summary.total_ac_power, 0)
+        self.card_pv_power.update(summary.total_pv_power, 0)
+        # Batería: mostrar signo
+        bp = summary.total_battery_power
+        self.card_bat_power.update(bp, 0)
+        if bp < 0:
+            self.card_bat_power.lbl_value.setStyleSheet(
+                "font-size:24px; font-weight:bold; color:#e74c3c;"  # Rojo = descargando
+            )
+        else:
+            self.card_bat_power.lbl_value.setStyleSheet(
+                "font-size:24px; font-weight:bold; color:#27ae60;"  # Verde = cargando
+            )
+
+        self.card_bat_voltage.update(summary.avg_battery_voltage, 1)
+
+        # Activos: formato "X / Y"
+        self.card_online.lbl_value.setText(f"{summary.online_count}")
+        self.card_online.lbl_unit.setText(f"/ {summary.total_count}")
+        if summary.online_count < summary.total_count:
+            self.card_online.lbl_value.setStyleSheet(
+                "font-size:24px; font-weight:bold; color:#f39c12;"  # Naranja = algunos offline
+            )
+        else:
+            self.card_online.lbl_value.setStyleSheet(
+                "font-size:24px; font-weight:bold; color:#27ae60;"  # Verde = todos online
+            )
+
+        # Alertas
+        if summary.alerts:
+            alert_text = "\n".join(f"• {a}" for a in summary.alerts[:5])  # Max 5
+            if len(summary.alerts) > 5:
+                alert_text += f"\n... y {len(summary.alerts) - 5} más"
+            self.lbl_alerts.setText(alert_text)
+            self.lbl_alerts.setStyleSheet("font-size:12px; color:#e74c3c;")
+            self.card_alerts.setStyleSheet(
+                "QFrame { background: #2d1f1f; border: 1px solid #e74c3c; border-radius: 10px; }"
+            )
+        else:
+            self.lbl_alerts.setText("Sin alertas")
+            self.lbl_alerts.setStyleSheet("font-size:12px; color:#27ae60;")
+            self.card_alerts.setStyleSheet(
+                "QFrame { background: #16213e; border: 1px solid #333; border-radius: 10px; }"
+            )
+
+    def update_table(self, inverter_list):
+        """Actualiza la tabla con datos de cada inversor."""
+        from core.multi_inverter import InverterData, InverterStatus
+
+        self.table.setSortingEnabled(False)  # Deshabilitar sort mientras actualizamos
+        self.table.setRowCount(len(inverter_list))
+
+        STATUS_EMOJI = {
+            InverterStatus.ONLINE: "🟢 Online",
+            InverterStatus.WARNING: "🟠 Advertencia",
+            InverterStatus.FAULT: "🔴 Falla",
+            InverterStatus.OFFLINE: "⚫ Offline",
+            InverterStatus.UNKNOWN: "⚪ Desconocido",
+        }
+
+        STATUS_BG = {
+            InverterStatus.ONLINE: "#1a2e1a",      # Verde oscuro
+            InverterStatus.WARNING: "#2e2a1a",      # Naranja oscuro
+            InverterStatus.FAULT: "#2e1a1a",        # Rojo oscuro
+            InverterStatus.OFFLINE: "#1a1a1a",      # Gris oscuro
+            InverterStatus.UNKNOWN: "#1a1a1a",      # Gris
+        }
+
+        for row, inv in enumerate(inverter_list):
+            # ID
+            id_item = QTableWidgetItem(str(inv.slave_id))
+            id_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 0, id_item)
+
+            # Estado
+            status_item = QTableWidgetItem(STATUS_EMOJI.get(inv.status, "⚪ ?"))
+            status_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 1, status_item)
+
+            # Modo
+            mode_item = QTableWidgetItem(inv.working_mode)
+            mode_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 2, mode_item)
+
+            # V.Bat
+            bat_v = QTableWidgetItem(f"{inv.battery_voltage:.1f}" if inv.is_online else "—")
+            bat_v.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 3, bat_v)
+
+            # I.Bat
+            bat_i = QTableWidgetItem(f"{inv.battery_current:.1f}" if inv.is_online else "—")
+            bat_i.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 4, bat_i)
+
+            # P.Bat
+            bat_p = QTableWidgetItem(f"{inv.battery_power:.0f}" if inv.is_online else "—")
+            bat_p.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 5, bat_p)
+
+            # P.AC
+            ac_p = QTableWidgetItem(f"{inv.output_active_power:.0f}" if inv.is_online else "—")
+            ac_p.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 6, ac_p)
+
+            # V.AC
+            ac_v = QTableWidgetItem(f"{inv.output_voltage:.1f}" if inv.is_online else "—")
+            ac_v.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 7, ac_v)
+
+            # Fallo
+            fault_item = QTableWidgetItem(inv.fault_description)
+            fault_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 8, fault_item)
+
+            # Color de fondo según estado
+            bg = STATUS_BG.get(inv.status, "#1a1a1a")
+            for col in range(9):
+                item = self.table.item(row, col)
+                if item:
+                    item.setBackground(QColor(bg))
+
+        self.table.setSortingEnabled(True)
+
+    def update_poll_progress(self, current: int, total: int):
+        """Actualiza el indicador de progreso del ciclo de polling."""
+        self.lbl_poll_status.setText(f"Consultando {current}/{total}...")
+        self.progress_poll.setVisible(True)
+        self.progress_poll.setMaximum(total)
+        self.progress_poll.setValue(current)
+
+    def update_poll_done(self):
+        """Marca el ciclo de polling como completo."""
+        self.lbl_poll_status.setText("✓ Ciclo completo")
+        self.progress_poll.setVisible(False)
+
+    def _on_row_double_clicked(self, row: int, col: int):
+        """Doble clic en una fila → navegar a Monitor para ese inversor."""
+        id_item = self.table.item(row, 0)
+        if id_item:
+            try:
+                slave_id = int(id_item.text())
+                self.navigate_to_inverter.emit(slave_id)
+            except (ValueError, TypeError):
+                pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — SETTINGS (LECTURA)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -851,8 +1313,19 @@ class TabSettings(QWidget):
         self._build_ui()
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
         layout.setSpacing(12)
+        layout.setContentsMargins(10, 10, 10, 10)
 
         row_btns = QHBoxLayout()
         self.btn_read = QPushButton("Leer configuración del inversor")
@@ -947,6 +1420,9 @@ class TabSettings(QWidget):
 
         layout.addStretch()
 
+        scroll.setWidget(container)
+        outer.addWidget(scroll)
+
     def update_settings(self, settings: ModbusSettings):
         self._settings = settings
 
@@ -1004,8 +1480,19 @@ class TabControl(QWidget):
         self._build_ui()
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
         layout.setSpacing(10)
+        layout.setContentsMargins(10, 10, 10, 10)
 
         self.lbl_status = QLabel("Sin conexión — Conecta el inversor primero")
         self.lbl_status.setAlignment(Qt.AlignCenter)
@@ -1225,6 +1712,10 @@ class TabControl(QWidget):
         self.txt_log.setMinimumHeight(100)
         gl.addWidget(self.txt_log)
         layout.addWidget(grp_log)
+
+        layout.addStretch()
+        scroll.setWidget(container)
+        outer.addWidget(scroll)
 
     def set_connection(self, conn: ModbusConnection):
         self._conn = conn
@@ -1463,8 +1954,19 @@ class TabScanner(QWidget):
         self._build_ui()
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
         layout.setSpacing(12)
+        layout.setContentsMargins(10, 10, 10, 10)
 
         # ── Info ──
         grp_info = QGroupBox("🔍 Scanner de Registros Modbus")
@@ -1567,6 +2069,10 @@ class TabScanner(QWidget):
         self.txt_log.setMinimumHeight(100)
         gl.addWidget(self.txt_log)
         layout.addWidget(grp_log)
+
+        layout.addStretch()
+        scroll.setWidget(container)
+        outer.addWidget(scroll)
 
     def set_connection(self, conn: ModbusConnection):
         self._conn = conn
@@ -1775,8 +2281,19 @@ class TabAPI(QWidget):
         self._build_ui()
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
         layout.setSpacing(12)
+        layout.setContentsMargins(10, 10, 10, 10)
 
         grp_api = QGroupBox("Servidor REST local (FastAPI)")
         ga = QVBoxLayout(grp_api)
@@ -1838,6 +2355,10 @@ class TabAPI(QWidget):
         self.txt_json.setText("{\n  // Esperando datos del inversor...\n}")
         gj.addWidget(self.txt_json)
         layout.addWidget(grp_json)
+
+        layout.addStretch()
+        scroll.setWidget(container)
+        outer.addWidget(scroll)
 
     def update_data(self, status: ModbusStatus):
         self._last_status = status
@@ -1992,6 +2513,8 @@ class MainWindow(QMainWindow):
 
         self._conn: ModbusConnection = None
         self._monitor: ModbusMonitorThread = None
+        self._multi_thread = None  # MultiInverterThread
+        self._multi_config = None  # MultiInverterConfig actual
         self._profile_manager = ProfileManager()
 
         self._build_ui()
@@ -2013,6 +2536,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tab_conn = TabConnection()
         self.tab_monitor = TabMonitor()
+        self.tab_parallel = TabParallelSystem()
         self.tab_settings = TabSettings()
         self.tab_control = TabControl()
         self.tab_scanner = TabScanner()
@@ -2021,17 +2545,22 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(self.tab_conn, "Conexión")
         self.tabs.addTab(self.tab_monitor, "Monitor")
+        self._tab_parallel_idx = self.tabs.addTab(self.tab_parallel, "⚡ Sistema en Paralelo")
         self.tabs.addTab(self.tab_settings, "Settings")
         self.tabs.addTab(self.tab_control, "Control (9 params)")
         self.tabs.addTab(self.tab_scanner, "🔍 Scanner")
         self.tabs.addTab(self.tab_profiles, "Perfiles")
         self.tabs.addTab(self.tab_api, "API")
+        # Ocultar tab paralelo por defecto (se muestra si multi-inversor está habilitado)
+        self.tabs.removeTab(self._tab_parallel_idx)
         main_layout.addWidget(self.tabs)
 
         self.tab_conn.connect_requested.connect(self._on_connect)
         self.tab_conn.disconnect_requested.connect(self._on_disconnect)
         self.tab_settings.refresh_requested.connect(self._read_settings)
         self.tab_monitor.poll_interval_changed.connect(self._on_interval_changed)
+        self.tab_parallel.navigate_to_inverter.connect(self._on_navigate_to_inverter)
+        self.tab_conn.multi_config_changed.connect(self._on_multi_config_changed)
 
     def _build_status_bar(self):
         self.statusBar().showMessage("Listo · Protocolo: Modbus RTU · RS232 / TCP + Scanner")
@@ -2052,14 +2581,20 @@ class MainWindow(QMainWindow):
                 host = config.get('host', '')
                 port = config.get('port', 502)
                 timeout = config.get('timeout', 5.0)
+                framing = config.get('framing', 'mbap')
+                slave_id = config.get('slave_id', 1)
                 if not host:
                     self.tab_conn.log("⚠ Dirección IP vacía", '#f39c12')
                     self.tab_conn.btn_connect.setEnabled(True)
                     self.tab_conn.btn_connect.setText("Conectar Modbus")
                     return
-                self.tab_conn.log(f"Conectando a {host}:{port} (TCP)...", '#3498db')
+                self.tab_conn.log(
+                    f"Conectando a {host}:{port} "
+                    f"({framing.upper()}, slave {slave_id})...",
+                    '#3498db'
+                )
                 self.statusBar().showMessage(f"Conectando a {host}:{port}...")
-                self._conn = ModbusTCPConnection(host, port, timeout)
+                self._conn = ModbusTCPConnection(host, port, timeout, slave_id, framing)
             else:
                 port = config.get('port', '')
                 if not port or port == "(sin puertos)":
@@ -2068,10 +2603,15 @@ class MainWindow(QMainWindow):
                     self.tab_conn.btn_connect.setText("Conectar Modbus")
                     return
                 serial_config = {k: v for k, v in config.items() if k != 'port'}
+                slave_id = config.get('slave_id', 1)
                 baud = serial_config.get('baudrate', 2400)
-                self.tab_conn.log(f"Conectando a {port} @ {baud} baud (RS232)...", '#3498db')
+                self.tab_conn.log(
+                    f"Conectando a {port} @ {baud} baud "
+                    f"(RS232, slave {slave_id})...",
+                    '#3498db'
+                )
                 self.statusBar().showMessage(f"Conectando a {port}...")
-                self._conn = ModbusConnection(port, serial_config)
+                self._conn = ModbusConnection(port, serial_config, slave_id)
 
             ok, msg = self._conn.connect()
             self.tab_conn.set_connected(ok, msg)
@@ -2079,11 +2619,23 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"{'✅ Conectado' if ok else '❌ Error'}: {msg}")
 
             if ok:
+                # Leer config multi-inversor
+                self._multi_config = self.tab_conn.get_multi_config()
                 self.tab_conn.log("Iniciando monitoreo en tiempo real...", '#3498db')
                 self.tab_control.set_connection(self._conn)
                 self.tab_scanner.set_connection(self._conn)
                 self._start_monitor()
                 self._read_settings()
+                if self._multi_config.enabled:
+                    detalles = ", ".join(
+                        f"ID {e.slave_id} ({e.map_label})"
+                        for e in self._multi_config.entries
+                    )
+                    self.tab_conn.log(
+                        f"⚙ Modo multi-inversor: "
+                        f"{len(self._multi_config.entries)} inversores -> {detalles}",
+                        '#9b59b6'
+                    )
             else:
                 self._conn = None
                 self.tab_conn.btn_connect.setEnabled(True)
@@ -2099,17 +2651,43 @@ class MainWindow(QMainWindow):
         if self._conn:
             self._conn.disconnect()
             self._conn = None
+        self._multi_config = None
         self.tab_conn.set_connected(False)
         self.tab_conn.btn_connect.setEnabled(True)
         self.tab_conn.btn_connect.setText("Conectar Modbus")
         self.tab_conn.log("Desconectado", '#f39c12')
         self.tab_control.set_connection(None)
         self.tab_scanner.set_connection(None)
+        self._show_parallel_tab(False)
         self.statusBar().showMessage("Desconectado · Modbus RTU")
 
     def _start_monitor(self):
-        if self._monitor:
-            self._monitor.stop()
+        # Detener threads previos si existen
+        self._stop_monitor()
+
+        # Si multi-inversor está habilitado, usar MultiInverterThread
+        if self._multi_config and self._multi_config.enabled:
+            from core.multi_inverter import MultiInverterThread
+            self._multi_thread = MultiInverterThread(self._conn, self._multi_config)
+            self._multi_thread.data_updated.connect(self._on_multi_data)
+            self._multi_thread.summary_updated.connect(self._on_multi_summary)
+            self._multi_thread.error_occurred.connect(
+                lambda e: self.tab_conn.log(f"⚠ [Multi] {e}", '#e74c3c')
+            )
+            self._multi_thread.poll_progress.connect(self._on_multi_progress)
+            self._multi_thread.connection_lost.connect(self._on_connection_lost)
+            self._multi_thread.start()
+            # Mostrar tab "Sistema en Paralelo"
+            self._show_parallel_tab(True)
+            self.tab_conn.log(
+                f"✓ Monitoreo multi-inversor iniciado "
+                f"({self._multi_config.total_inverters} IDs, "
+                f"cada {self._multi_config.poll_interval_sec:.1f}s)",
+                '#27ae60'
+            )
+            return
+
+        # Modo individual (1 inversor)
         interval = self.tab_monitor.sl_interval.value()
         self._monitor = ModbusMonitorThread(self._conn, float(interval))
         self._monitor.data_received.connect(self._on_data)
@@ -2130,6 +2708,9 @@ class MainWindow(QMainWindow):
         if self._monitor:
             self._monitor.stop()
             self._monitor = None
+        if self._multi_thread:
+            self._multi_thread.stop()
+            self._multi_thread = None
 
     def _on_data(self, status: ModbusStatus):
         self.tab_monitor.update_data(status)
@@ -2144,6 +2725,7 @@ class MainWindow(QMainWindow):
     def _on_connection_lost(self):
         """Se perdió la conexión tras errores consecutivos."""
         self._monitor = None
+        self._multi_thread = None
         if self._conn:
             self._conn.disconnect()
             self._conn = None
@@ -2158,17 +2740,107 @@ class MainWindow(QMainWindow):
     def _read_settings(self):
         if not self._conn or not self._conn.is_open:
             return
-        settings = self._conn.read_settings()
+        # Usar el mapa del primer inversor configurado (si hay multi-inversor)
+        map_name = None
+        if self._multi_config and self._multi_config.entries:
+            map_name = self._multi_config.entries[0].map_name
+        settings = self._conn.read_settings(map=map_name)
         if settings:
             self.tab_settings.update_settings(settings)
             self.tab_control.update_from_settings(settings)
             self.tab_conn.log("Settings leídos correctamente", '#27ae60')
         else:
-            self.tab_conn.log("Error al leer settings", '#e74c3c')
+            self.tab_conn.log(
+                "No se pudieron leer los settings "
+                "(el mapa activo no define bloque de ajustes)",
+                '#f39c12'
+            )
 
     def _on_interval_changed(self, seconds: float):
         if self._monitor:
             self._monitor.interval = seconds
+
+    # ── Handlers para Multi-Inversor ──
+
+    def _on_multi_data(self, inverter_list):
+        """Recibe datos de todos los inversores (List[InverterData])."""
+        self.tab_parallel.update_table(inverter_list)
+        # También actualizar el Monitor con el primer inversor online (compatibilidad)
+        for inv in inverter_list:
+            if inv.is_online and inv.status != InverterStatus.UNKNOWN:
+                try:
+                    # Cambiar slave_id temporalmente para leer ese inversor
+                    if self._conn:
+                        original_id = self._conn.slave_id
+                        self._conn.slave_id = inv.slave_id
+                        status = self._conn.read_status()
+                        self._conn.slave_id = original_id
+                        if status:
+                            self._on_data(status)
+                except Exception:
+                    pass
+                break
+
+    def _on_multi_summary(self, summary):
+        """Recibe el resumen agregado del sistema (SystemSummary)."""
+        self.tab_parallel.update_summary(summary)
+        self.tab_parallel.update_poll_done()
+        self.statusBar().showMessage(
+            f"⚡ Sistema: {summary.online_count}/{summary.total_count} online · "
+            f"AC {summary.total_ac_power:.0f}W · PV {summary.total_pv_power:.0f}W · "
+            f"Bat {summary.avg_battery_voltage:.1f}V"
+            + (f" · ⚠ {len(summary.alerts)} alertas" if summary.alerts else "")
+        )
+
+    def _on_multi_progress(self, current: int, total: int):
+        """Progreso del ciclo de polling (current/total)."""
+        self.tab_parallel.update_poll_progress(current, total)
+
+    def _on_multi_config_changed(self, enabled: bool):
+        """Se habilitó/deshabilitó el checkbox multi-inversor en TabConnection."""
+        self._show_parallel_tab(enabled)
+        if enabled:
+            # Mostrar la tab con datos placeholder
+            entries = self.tab_conn.get_multi_config().entries
+            n = len(entries)
+            start = entries[0].slave_id if entries else 1
+            detalles = ", ".join(
+                f"ID {e.slave_id} ({e.map_label})" for e in entries
+            )
+            self.tab_conn.log(
+                f"⚙ Modo multi-inversor habilitado: {n} inversores "
+                f"-> {detalles}", '#9b59b6'
+            )
+            # Llenar tabla con placeholders "Desconocido"
+            from core.multi_inverter import InverterData, InverterStatus
+            placeholders = [
+                InverterData(slave_id=e.slave_id, label=e.label, map_name=e.map_name)
+                for e in entries
+            ]
+            self.tab_parallel.update_table(placeholders)
+        else:
+            self.tab_conn.log("⚙ Modo multi-inversor deshabilitado", '#888')
+
+    def _show_parallel_tab(self, show: bool):
+        """Muestra u oculta la pestaña 'Sistema en Paralelo'."""
+        # Buscar si ya está insertada
+        idx = self.tabs.indexOf(self.tab_parallel)
+        if show and idx < 0:
+            # Insertar después de Monitor (índice 1)
+            self._tab_parallel_idx = self.tabs.insertTab(
+                2, self.tab_parallel, "⚡ Sistema en Paralelo"
+            )
+        elif not show and idx >= 0:
+            self.tabs.removeTab(idx)
+
+    def _on_navigate_to_inverter(self, slave_id: int):
+        """Doble clic en un inversor → navegar al Monitor para ese ID."""
+        if self._conn:
+            self._conn.slave_id = slave_id
+            self.tabs.setCurrentIndex(self.tabs.indexOf(self.tab_monitor))
+            self.tab_conn.log(
+                f"→ Navegando a Monitor — Inversor ID {slave_id}", '#9b59b6'
+            )
 
     def closeEvent(self, event):
         self._stop_monitor()

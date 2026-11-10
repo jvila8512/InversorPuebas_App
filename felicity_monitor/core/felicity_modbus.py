@@ -4,6 +4,7 @@ Implementación completa del protocolo Modbus RTU.
 Compatible con el proyecto C# Felicity-Inverter-Monitor-master
 """
 
+import logging
 import struct
 import time
 from dataclasses import dataclass, field
@@ -23,6 +24,16 @@ except ImportError:
 
 import serial
 import serial.tools.list_ports
+
+from core.register_maps import (
+    CLASSIC_MAP,
+    RegisterMap,
+    decode_status_fields,
+    get_map,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -114,6 +125,7 @@ class ModbusStatus:
     """Estado del inversor leído via Modbus RTU — Registros 0x1100-0x112A."""
     # Raw registers
     raw_registers: list = field(default_factory=list)
+    map_name: str = "classic"
 
     # ── Modos (0x1100-0x1104) ──
     setting_data_sn: int = 0           # 0x1100 — Contador de cambios en settings
@@ -444,14 +456,22 @@ class ModbusConnection:
     Implementación basada en FelicityInverter.cs (proyecto C#).
     """
 
-    def __init__(self, port: str, config: dict = None):
+    MAX_READ_BLOCK = 60    # máximo de registros por petición
+
+    def __init__(self, port: str, config: dict = None, slave_id: int = 1):
         self.port = port
         self.config = {**DEFAULT_MODBUS_CONFIG, **(config or {})}
+        self.slave_id = slave_id
+        self.map: RegisterMap = CLASSIC_MAP
         self._serial: Optional[serial.Serial] = None
         self._lock = None
-        
+
         # Cache del frame de status (optimización)
         self._cached_status_frame: Optional[bytes] = None
+
+    def set_map(self, map) -> None:
+        """Establece el mapa de registros activo para lecturas/escrituras."""
+        self.map = get_map(map)
 
     def connect(self) -> tuple[bool, str]:
         """
@@ -506,7 +526,7 @@ class ModbusConnection:
                 # Construir trama de request:
                 # [Slave ID][Function][Address Hi][Address Lo][Count Hi][Count Lo][CRC]
                 frame = bytearray([
-                    SLAVE_ADDRESS,
+                    self.slave_id,
                     FUNCTION_READ_HOLDING,
                     (start_address >> 8) & 0xFF,
                     start_address & 0xFF,
@@ -528,7 +548,7 @@ class ModbusConnection:
                     continue
 
                 # Verificar slave ID y function code
-                if response[0] != SLAVE_ADDRESS:
+                if response[0] != self.slave_id:
                     continue
 
                 # Verificar Modbus exception
@@ -604,13 +624,23 @@ class ModbusConnection:
         if not self.is_open:
             return WriteResult(False, register_address, value, 0.0, "No conectado")
 
+        if self.map is not None and self.map.settings_start is None:
+            logger.warning(
+                "mapa sin bloque de ajustes: no se puede escribir en %s",
+                self.map.label,
+            )
+            return WriteResult(
+                False, register_address, value, 0.0,
+                "mapa sin bloque de ajustes",
+            )
+
         start_time = time.perf_counter()
 
         try:
             # Construir trama:
             # [Slave][Func][Address Hi][Address Lo][Value Hi][Value Lo][CRC]
             frame = bytearray([
-                SLAVE_ADDRESS,
+                self.slave_id,
                 FUNCTION_WRITE_SINGLE,
                 (register_address >> 8) & 0xFF,
                 register_address & 0xFF,
@@ -634,7 +664,7 @@ class ModbusConnection:
                                  "Sin respuesta del inversor")
 
             # Verificar que sea echo del request
-            if response[0] == SLAVE_ADDRESS and response[1] == FUNCTION_WRITE_SINGLE:
+            if response[0] == self.slave_id and response[1] == FUNCTION_WRITE_SINGLE:
                 return WriteResult(True, register_address, value, latency)
 
             # Verificar exception
@@ -652,189 +682,200 @@ class ModbusConnection:
     # Operaciones de alto nivel - Estado
     # ─────────────────────────────────────────────────────────────────────────
 
-    def read_status(self) -> Optional[ModbusStatus]:
+    def _read_status_registers(self, map_obj: RegisterMap) -> Optional[list]:
+        """Lee el bloque de estado completo, partiéndolo en bloques <= 60."""
+        registers: list = []
+        addr = map_obj.status_start
+        remaining = map_obj.status_count
+
+        while remaining > 0:
+            chunk = min(self.MAX_READ_BLOCK, remaining)
+            regs = self.read_holding_registers(addr, chunk)
+            if regs is None or len(regs) < chunk:
+                return None
+            registers.extend(regs)
+            addr += chunk
+            remaining -= chunk
+
+        return registers
+
+    def read_status(self, map=None) -> Optional[ModbusStatus]:
         """
         Lee el estado actual del inversor.
-        Lee los registros 0x1100 - 0x112A (42+1 registros).
-        Implementación basada en FelicityInverter.cs + protocolo oficial.
+        Decodifica según el mapa indicado (por defecto, el mapa activo).
+        Soporta ambos mapas: 'classic' (5K/IVEM) e 'ivgm_8k' (IVGM-8K).
         """
-        # Leemos desde 0x1100 para incluir SettingDataSn
-        regs = self.read_holding_registers(STATUS_START - 1, STATUS_COUNT + 1)
+        map_obj = get_map(map) if map is not None else (self.map or CLASSIC_MAP)
+        if map is not None:
+            self.map = map_obj
 
-        if regs is None or len(regs) < STATUS_COUNT + 1:
-            # Fallback: intentar sin 0x1100
-            regs = self.read_holding_registers(STATUS_START, STATUS_COUNT)
-            if regs is None or len(regs) < STATUS_COUNT:
-                return None
-            regs = [0] + regs  # prepend dummy para 0x1100
+        regs = self._read_status_registers(map_obj)
+        if regs is None:
+            return None
+
+        decoded = decode_status_fields(regs, map_obj.status_start, map_obj)
 
         status = ModbusStatus()
         status.raw_registers = list(regs)
+        status.map_name = map_obj.name
 
-        # Offset 0 (0x1100): SettingDataSn
-        status.setting_data_sn = regs[0]
+        status.setting_data_sn = int(decoded.get("setting_data_sn", 0))
+        status.working_mode = WorkingMode.from_int(int(decoded.get("working_mode", 0)))
+        status.charge_mode = ChargeMode.from_int(int(decoded.get("charge_mode", 0)))
+        status.fault_code = int(decoded.get("fault_code", 0))
+        status.power_flow_raw = int(decoded.get("power_flow", 0))
 
-        # Offset 1 (0x1101): Working mode
-        status.working_mode = WorkingMode.from_int(regs[1])
+        status.battery_voltage = round(float(decoded.get("battery_voltage", 0.0)), 1)
 
-        # Offset 2 (0x1102): Charge mode
-        status.charge_mode = ChargeMode.from_int(regs[2])
-
-        # Offset 3 (0x1103): Fault code
-        status.fault_code = regs[3]
-
-        # Offset 4 (0x1104): PowerFlowMsg
-        status.power_flow_raw = regs[4]
-
-        # Offset 8 (0x1108): Battery voltage / 100
-        status.battery_voltage = round(regs[8] / 100.0, 1)
-
-        # Offset 9 (0x1109): Battery current (signed)
-        current = self._signed_value(regs[9])
+        current = float(decoded.get("battery_current", 0.0))
         status.battery_current = current
         if current < 0:
             status.battery_discharge_a = abs(current)
         else:
             status.battery_charge_a = current
 
-        # Offset 10 (0x110A): Battery power (signed)
-        power = self._signed_value(regs[10])
-        status.battery_power = power
+        power = float(decoded.get("battery_power", 0.0))
+        status.battery_power = int(power)
         if power < 0:
-            status.battery_discharge_w = abs(power)
+            status.battery_discharge_w = abs(int(power))
         else:
-            status.battery_charge_w = power
+            status.battery_charge_w = int(power)
 
-        # Offset 17 (0x1111): AC Output voltage / 10
-        status.output_voltage = round(regs[17] / 10.0, 1)
+        if "battery_soc" in decoded:
+            status.battery_soc = int(round(decoded["battery_soc"]))
 
-        # Offset 23 (0x1117): Grid voltage / 10
-        status.grid_voltage = round(regs[23] / 10.0, 1)
-
-        # Offset 25 (0x1119): AC input frequency / 100
-        status.grid_frequency = round(regs[25] / 100.0, 2)
-
-        # Offset 30 (0x111E): Output active power (signed)
-        status.output_active_power = self._signed_value(regs[30])
+        status.output_voltage = round(float(decoded.get("output_voltage", 0.0)), 1)
+        status.grid_voltage = round(float(decoded.get("grid_voltage", 0.0)), 1)
+        status.grid_frequency = round(float(decoded.get("grid_frequency", 0.0)), 2)
+        status.output_active_power = int(decoded.get("output_active_power", 0))
         status.load_watts = status.output_active_power
-
-        # Offset 31 (0x111F): Output apparent power
-        status.output_apparent_power = regs[31]
-
-        # Offset 32 (0x1120): Load percent
-        status.load_percent = regs[32]
-
-        # Offset 38 (0x1126): PV voltage / 10
-        status.pv_voltage = round(regs[38] / 10.0, 1)
-
-        # Offset 42 (0x112A): PV power (signed)
-        status.pv_power = self._signed_value(regs[42])
+        status.output_apparent_power = int(decoded.get("output_apparent_power", 0))
+        status.load_percent = int(decoded.get("load_percent", 0))
+        status.pv_voltage = round(float(decoded.get("pv_voltage", 0.0)), 1)
+        status.pv_power = int(decoded.get("pv_power", 0))
 
         return status
 
-    def read_settings(self) -> Optional[ModbusSettings]:
+    def read_settings(self, map=None) -> Optional[ModbusSettings]:
         """
         Lee la configuración actual del inversor.
-        Lee los registros 0x211F - 0x2159 (59 registros).
-        Ahora incluye todos los parámetros del protocolo.
+        Si el mapa no tiene bloque de ajustes, devuelve None con advertencia.
         """
-        regs = self.read_holding_registers(SETTINGS_START, SETTINGS_COUNT)
+        map_obj = get_map(map) if map is not None else (self.map or CLASSIC_MAP)
+        if map is not None:
+            self.map = map_obj
 
-        if regs is None or len(regs) < SETTINGS_COUNT:
+        if map_obj.settings_start is None or map_obj.settings_count <= 0:
+            logger.warning("mapa sin bloque de ajustes: %s", map_obj.label)
+            return None
+
+        regs = self.read_holding_registers(map_obj.settings_start, map_obj.settings_count)
+
+        if regs is None or len(regs) < map_obj.settings_count:
             return None
 
         settings = ModbusSettings()
         settings.raw_registers = list(regs)
 
-        # Offset 0 (0x211F): Battery cut-off voltage / 10
+        # Los offsets son relativos al inicio del bloque de ajustes (0x211F
+        # en el mapa clásico).
+        # Offset 0: Battery cut-off voltage / 10
         settings.battery_cutoff_voltage = regs[0] / 10.0
 
-        # Offset 3 (0x2122): Battery CV voltage / 10
+        # Offset 3: Battery CV voltage / 10
         settings.battery_cv_voltage = regs[3] / 10.0
 
-        # Offset 4 (0x2123): Battery float voltage / 10
+        # Offset 4: Battery float voltage / 10
         settings.battery_float_voltage = regs[4] / 10.0
 
-        # Offset 10 (0x2129): AC output frequency (0=50Hz, 1=60Hz)
+        # Offset 10: AC output frequency (0=50Hz, 1=60Hz)
         settings.ac_output_frequency = regs[10]
 
-        # Offset 11 (0x212A): Output priority
+        # Offset 11: Output priority
         try:
             settings.output_priority = OutputPriority(regs[11])
         except ValueError:
             settings.output_priority = OutputPriority.SOLAR_FIRST
 
-        # Offset 12 (0x212B): Application mode
+        # Offset 12: Application mode
         settings.application_mode = regs[12]
 
-        # Offset 13 (0x212C): Charge priority
+        # Offset 13: Charge priority
         try:
             settings.charge_priority = ChargePriority(regs[13])
         except ValueError:
             settings.charge_priority = ChargePriority.SOLAR_AND_UTILITY
 
-        # Offset 14 (0x212D): Battery type
+        # Offset 14: Battery type
         settings.battery_type = regs[14]
 
-        # Offset 15 (0x212E): Max charging current
+        # Offset 15: Max charging current
         settings.max_charge_current = regs[15]
 
-        # Offset 17 (0x2130): Max AC charging current
+        # Offset 17: Max AC charging current
         settings.max_ac_charge_current = regs[17]
 
-        # Offset 18 (0x2131): Buzzer enable
+        # Offset 18: Buzzer enable
         settings.buzzer_enabled = bool(regs[18])
 
-        # Offset 20 (0x2133): Overload restart enable
+        # Offset 20: Overload restart enable
         settings.overload_restart = bool(regs[20])
 
-        # Offset 21 (0x2134): Over temperature restart enable
+        # Offset 21: Over temperature restart enable
         settings.over_temp_restart = bool(regs[21])
 
-        # Offset 22 (0x2135): LCD backlight enable
+        # Offset 22: LCD backlight enable
         settings.lcd_backlight = bool(regs[22])
 
-        # Offset 24 (0x2137): Overload to bypass
+        # Offset 24: Overload to bypass
         settings.overload_to_bypass = bool(regs[24])
 
-        # Offset 55 (0x2156): Battery back to grid voltage / 10
+        # Offset 55: Battery back to grid voltage / 10
         settings.battery_back_to_grid_voltage = regs[55] / 10.0
 
-        # Offset 58 (0x2159): Battery back to battery voltage / 10
+        # Offset 58: Battery back to battery voltage / 10
         settings.battery_back_to_battery_voltage = regs[58] / 10.0
 
         return settings
 
-    def read_info(self) -> Optional['ModbusInfo']:
+    def read_info(self, map=None) -> Optional['ModbusInfo']:
         """
         Lee la información del equipo.
-        Registros 0xF800 - 0xF80C (13 registros).
+        Si el mapa no tiene bloque de información, devuelve None.
         """
-        regs = self.read_holding_registers(INFO_START, INFO_COUNT)
+        map_obj = get_map(map) if map is not None else (self.map or CLASSIC_MAP)
+        if map is not None:
+            self.map = map_obj
 
-        if regs is None or len(regs) < INFO_COUNT:
+        if map_obj.info_start is None or map_obj.info_count <= 0:
+            logger.warning("mapa sin bloque de información: %s", map_obj.label)
+            return None
+
+        regs = self.read_holding_registers(map_obj.info_start, map_obj.info_count)
+
+        if regs is None or len(regs) < map_obj.info_count:
             return None
 
         info = ModbusInfo()
         info.raw_registers = list(regs)
 
-        # Offset 0 (0xF800): Equipment type
+        # Offset 0: Equipment type
         info.equipment_type = regs[0]
 
-        # Offset 1 (0xF801): Sub type
+        # Offset 1: Sub type
         info.sub_type = regs[1]
 
-        # Offset 4-8 (0xF804-0xF808): Serial number (5 registros)
+        # Offset 4-8: Serial number (5 registros)
         sn_parts = []
         for i in range(4, 9):
             if i < len(regs) and regs[i] != 0:
                 sn_parts.append(f"{regs[i]:04d}")
         info.serial_number = ''.join(sn_parts)
 
-        # Offset 11 (0xF80B): CPU1 FW version
+        # Offset 11: CPU1 FW version
         info.cpu1_fw_version = regs[11]
 
-        # Offset 12 (0xF80C): CPU2 FW version
+        # Offset 12: CPU2 FW version
         info.cpu2_fw_version = regs[12]
 
         return info
