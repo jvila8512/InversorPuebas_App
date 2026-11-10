@@ -25,7 +25,8 @@ BAUD_RATES = [2400, 4800, 9600, 19200, 38400]
 
 
 class TabProfiles(QWidget):
-    profile_changed = pyqtSignal(object)   # InverterProfile
+    profile_changed = pyqtSignal(object)      # InverterProfile (activo)
+    profiles_changed = pyqtSignal()           # la lista de perfiles cambió
 
     def __init__(self, manager: ProfileManager):
         super().__init__()
@@ -104,6 +105,24 @@ class TabProfiles(QWidget):
         self.le_protocol.setReadOnly(True)
         self.le_protocol.setStyleSheet("color:#888;")
         gi.addWidget(self.le_protocol, 2, 1)
+
+        gi.addWidget(QLabel("Mapa Modbus:"), 2, 2)
+        self.cb_register_map = QComboBox()
+        from core.register_maps import MAPS
+        for key, mapa in MAPS.items():
+            self.cb_register_map.addItem(mapa.label, key)
+        self.cb_register_map.setToolTip(
+            "Mapa de registros que define cómo se interpretan los datos "
+            "del inversor. El IVGM-8K usa 'Series RS485'."
+        )
+        gi.addWidget(self.cb_register_map, 2, 3)
+
+        lbl_map_note = QLabel(
+            "El mapa Modbus define cómo se interpretan los registros.\n"
+            "Clásico: 5K / IVEM 48V · IVGM-8K: Series RS485 (9600 baud)."
+        )
+        lbl_map_note.setStyleSheet("color:#888; font-size:10px;")
+        gi.addWidget(lbl_map_note, 3, 0, 1, 4)
 
         right.addWidget(grp_info)
 
@@ -257,6 +276,11 @@ class TabProfiles(QWidget):
         self.le_model.setText(p.model)
         self.le_protocol.setText(p.protocol)
 
+        # Mapa de registros
+        idx = self.cb_register_map.findData(getattr(p, 'register_map', 'classic'))
+        if idx >= 0:
+            self.cb_register_map.setCurrentIndex(idx)
+
         # Baud
         for i in range(self.cb_baud.count()):
             if self.cb_baud.itemData(i) == p.baudrate:
@@ -308,6 +332,7 @@ class TabProfiles(QWidget):
             brand            = self.le_brand.text().strip(),
             model            = self.le_model.text().strip(),
             protocol         = "PI30",
+            register_map     = self.cb_register_map.currentData() or "classic",
             battery_type     = self.cb_bat_type.currentText(),
             battery_bank_v   = self.cb_bank_v.currentData(),
             baudrate         = self.cb_baud.currentData(),
@@ -389,6 +414,7 @@ class TabProfiles(QWidget):
 
         self._load_profile_list()
         self.cb_profiles.setCurrentIndex(self._editing_index)
+        self.profiles_changed.emit()
 
     def _on_activate(self):
         idx = self.cb_profiles.currentIndex()
@@ -402,6 +428,7 @@ class TabProfiles(QWidget):
         self.manager.add(p)
         self._load_profile_list()
         self.cb_profiles.setCurrentIndex(len(self.manager.profiles) - 1)
+        self.profiles_changed.emit()
 
     def _on_clone(self):
         idx = self.cb_profiles.currentIndex()
@@ -413,6 +440,7 @@ class TabProfiles(QWidget):
         self.manager.add(p)
         self._load_profile_list()
         self.cb_profiles.setCurrentIndex(len(self.manager.profiles) - 1)
+        self.profiles_changed.emit()
 
     def _on_delete(self):
         idx = self.cb_profiles.currentIndex()
@@ -428,3 +456,4 @@ class TabProfiles(QWidget):
             self.manager.delete(idx)
             self._load_profile_list()
             self._load_profile(self.manager.active_index)
+            self.profiles_changed.emit()

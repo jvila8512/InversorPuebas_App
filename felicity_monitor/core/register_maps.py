@@ -127,10 +127,39 @@ IVGM_8K_MAP = RegisterMap(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# MAPA MUST (PH/PV/EP — "Bloque D")
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# ATENCIÓN: este mapa proviene de una herramienta de terceros (aggsoft,
+# "PV Inverter 3600") y NO está validado contra hardware real.
+# Validalo con verificar_rs485.py antes de confiar en los valores.
+
+MUST_MAP = RegisterMap(
+    name="must",
+    label="MUST PH/PV/EP (Bloque D) — SIN VALIDAR",
+    status_start=0x6271,
+    status_count=35,
+    fields={
+        "working_mode":        FieldDef("working_mode", 0x6271, "Inverter Work State"),
+        "battery_voltage":     FieldDef("battery_voltage", 0x6275, "Battery Voltage", 0.1, False, "V"),
+        "output_voltage":      FieldDef("output_voltage", 0x6276, "Inverter Output Voltage", 0.1, False, "V"),
+        "grid_voltage":        FieldDef("grid_voltage", 0x6277, "Grid Voltage", 0.1, False, "V"),
+        "battery_current":     FieldDef("battery_current", 0x6279, "Battery Current", 0.1, True, "A"),
+        "output_current":      FieldDef("output_current", 0x627A, "Inverter Output Current", 0.1, True, "A"),
+        "inverter_power":      FieldDef("inverter_power", 0x627D, "Inverter Power", 1.0, True, "W"),
+        "grid_power":          FieldDef("grid_power", 0x627E, "Grid Power", 1.0, True, "W"),
+        "output_active_power": FieldDef("output_active_power", 0x627F, "Load Power", 1.0, True, "W"),
+        "load_percent":        FieldDef("load_percent", 0x6280, "System Load Percentage", 1.0, False, "%"),
+        "battery_soc":         FieldDef("battery_soc", 0x6283, "Battery Capacity (SOC)", 1.0, False, "%"),
+    },
+)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # REGISTRO DE MAPAS
 # ══════════════════════════════════════════════════════════════════════════════
 
-MAPS: Dict[str, RegisterMap] = {m.name: m for m in (CLASSIC_MAP, IVGM_8K_MAP)}
+MAPS: Dict[str, RegisterMap] = {m.name: m for m in (CLASSIC_MAP, IVGM_8K_MAP, MUST_MAP)}
 
 # Claves canónicas que la app consume en la UI. Todo mapa debe poder
 # decodificarlas; si un mapa no las provee, valen 0.0.

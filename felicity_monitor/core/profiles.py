@@ -8,6 +8,8 @@ import os
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
+from core.app_paths import data_file
+
 
 # ──────────────────────────────────────────────
 # Tipos de batería
@@ -119,6 +121,7 @@ class InverterProfile:
     brand:            str   = "Genérico"
     model:            str   = ""
     protocol:         str   = "PI30"
+    register_map:     str   = "classic"   # mapa de registros Modbus
     battery_type:     str   = "LiFePO4"
     battery_bank_v:   int   = 48
 
@@ -222,6 +225,23 @@ DEFAULT_PROFILES = [
         charge_priority="Solar + Utility (ambos)",
     ),
     InverterProfile(
+        name="Felicity IVGM-8K — LiFePO4 48V",
+        brand="Felicity",
+        model="IVGM8KLP2G1",
+        protocol="PI30",
+        register_map="ivgm_8k",
+        battery_type="LiFePO4",
+        battery_bank_v=48,
+        baudrate=9600,
+        float_v=54.0,
+        absorb_v=56.8,
+        recharge_v=48.0,
+        shutdown_v=44.0,
+        output_priority="Solar First (solar primero)",
+        charge_priority="Solar + Utility (ambos)",
+        notes="Mapa de registros IVGM-8K (Series RS485). RS485 a 9600 baud, 8N1.",
+    ),
+    InverterProfile(
         name="Axpert 3K — AGM 24V",
         brand="Voltronic / Axpert",
         model="3000W",
@@ -235,6 +255,26 @@ DEFAULT_PROFILES = [
         shutdown_v=21.0,
         output_priority="Utility First (red primero)",
         charge_priority="Solar + Utility (ambos)",
+    ),
+    InverterProfile(
+        name="MUST PH18/PV18 — LiFePO4 48V",
+        brand="MUST",
+        model="PH18/PV18",
+        protocol="PI30",
+        register_map="must",
+        battery_type="LiFePO4",
+        battery_bank_v=48,
+        baudrate=2400,
+        float_v=54.0,
+        absorb_v=56.8,
+        recharge_v=48.0,
+        shutdown_v=44.0,
+        output_priority="Solar First (solar primero)",
+        charge_priority="Solar + Utility (ambos)",
+        notes=(
+            "Mapa 'Bloque D' de MUST. SIN VALIDAR contra hardware: "
+            "verificar con verificar_rs485.py antes de confiar en los valores."
+        ),
     ),
     InverterProfile(
         name="Genérico PI30 — 48V",
@@ -256,7 +296,11 @@ DEFAULT_PROFILES = [
 # Gestor de perfiles (carga/guarda en JSON)
 # ──────────────────────────────────────────────
 
-PROFILES_FILE = os.path.join(os.path.dirname(__file__), "..", "profiles.json")
+PROFILES_FILE = data_file("profiles.json")
+
+# Version del esquema de perfiles. Sumar cuando se agregan modelos por
+# defecto, para que las instalaciones existentes los reciban.
+PROFILES_SCHEMA_VERSION = 3
 
 
 class ProfileManager:
@@ -270,14 +314,27 @@ class ProfileManager:
             try:
                 with open(PROFILES_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                self.profiles     = [InverterProfile.from_dict(d) for d in data.get("profiles", [])]
+                version = data.get("version", 1)
+                self.profiles = [
+                    InverterProfile.from_dict(d) for d in data.get("profiles", [])
+                ]
                 self.active_index = data.get("active_index", 0)
                 if not self.profiles:
                     self._load_defaults()
+                elif version < PROFILES_SCHEMA_VERSION:
+                    self._merge_missing_defaults()
                 return
             except Exception:
                 pass
         self._load_defaults()
+
+    def _merge_missing_defaults(self):
+        """Agrega los perfiles por defecto que falten (modelos nuevos)."""
+        existentes = {p.name for p in self.profiles}
+        for default in DEFAULT_PROFILES:
+            if default.name not in existentes:
+                self.profiles.append(default)
+        self.save()
 
     def _load_defaults(self):
         self.profiles     = list(DEFAULT_PROFILES)
@@ -285,8 +342,9 @@ class ProfileManager:
 
     def save(self):
         data = {
-            "profiles":     [p.to_dict() for p in self.profiles],
-            "active_index": self.active_index,
+            "version":        PROFILES_SCHEMA_VERSION,
+            "profiles":       [p.to_dict() for p in self.profiles],
+            "active_index":   self.active_index,
         }
         with open(PROFILES_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)

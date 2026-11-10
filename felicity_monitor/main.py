@@ -190,8 +190,9 @@ class TabConnection(QWidget):
     autodetect_requested = pyqtSignal(str)
     multi_config_changed = pyqtSignal(bool)  # enabled True/False
 
-    def __init__(self):
+    def __init__(self, profile_manager=None):
         super().__init__()
+        self.profile_manager = profile_manager
         self._build_ui()
 
     def _build_ui(self):
@@ -338,16 +339,26 @@ class TabConnection(QWidget):
         self.chk_multi_enabled.toggled.connect(self._on_multi_toggled)
         gm.addWidget(self.chk_multi_enabled)
 
-        # Tabla de inversores: slave_id + etiqueta + mapa
+        # Tabla de inversores: slave_id + etiqueta + perfil
         self.tbl_inverters = QTableWidget(0, 3)
         self.tbl_inverters.setHorizontalHeaderLabels(
-            ["Slave ID", "Etiqueta", "Modelo / Mapa"]
+            ["Slave ID", "Etiqueta", "Perfil / Modelo"]
         )
-        self.tbl_inverters.horizontalHeader().setStretchLastSection(True)
-        self.tbl_inverters.setMaximumHeight(110)
+        self.tbl_inverters.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.tbl_inverters.setMinimumHeight(170)
+        self.tbl_inverters.setMaximumHeight(320)
+        self.tbl_inverters.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.MinimumExpanding
+        )
+        self.tbl_inverters.verticalHeader().setVisible(True)
+        self.tbl_inverters.verticalHeader().setSectionResizeMode(
+            QHeaderView.ResizeToContents
+        )
+        self.tbl_inverters.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.tbl_inverters.setAlternatingRowColors(True)
         self.tbl_inverters.setToolTip(
-            "Cada fila es un inversor del bus. El mapa define cómo se "
-            "interpretan sus registros."
+            "Cada fila es un inversor físico del bus. Elegís el perfil que "
+            "define su modelo y su mapa de registros."
         )
         gm.addWidget(self.tbl_inverters)
 
@@ -462,11 +473,46 @@ class TabConnection(QWidget):
         # Auto-detectar solo tiene sentido en serial
         self.btn_autodetect.setEnabled(is_serial)
 
+    # ── Helpers de perfiles ─────────────────────────────────────────────────
+
+    def _profile_index_for_map(self, map_name: str) -> int:
+        """Índice del primer perfil cuyo mapa coincide con map_name."""
+        if not self.profile_manager:
+            return 0
+        for i, p in enumerate(self.profile_manager.profiles):
+            if getattr(p, 'register_map', 'classic') == map_name:
+                return i
+        return 0
+
+    def _map_for_profile_index(self, index: int) -> str:
+        """Mapa de registros asociado a un perfil por índice."""
+        if not self.profile_manager:
+            return "classic"
+        profiles = self.profile_manager.profiles
+        if 0 <= index < len(profiles):
+            return getattr(profiles[index], 'register_map', 'classic') or "classic"
+        return "classic"
+
+    def refresh_profile_choices(self):
+        """Reconstruye los combos de perfil conservando el mapa de cada fila."""
+        if not self.profile_manager:
+            return
+        for row in range(self.tbl_inverters.rowCount()):
+            cb = self.tbl_inverters.cellWidget(row, 2)
+            if not isinstance(cb, QComboBox):
+                continue
+            mapa_actual = self._map_for_profile_index(cb.currentIndex())
+            cb.blockSignals(True)
+            cb.clear()
+            for i, perfil in enumerate(self.profile_manager.profiles):
+                mapa = getattr(perfil, 'register_map', 'classic')
+                cb.addItem(f"{perfil.name}  [{mapa}]", i)
+            cb.setCurrentIndex(max(0, self._profile_index_for_map(mapa_actual)))
+            cb.blockSignals(False)
+
     def _add_inverter_row(self, slave_id: int = 1, label: str = "",
                           map_name: str = "classic"):
         """Agrega una fila a la tabla de inversores del bus."""
-        from core.register_maps import MAPS
-
         row = self.tbl_inverters.rowCount()
         self.tbl_inverters.insertRow(row)
 
@@ -480,15 +526,17 @@ class TabConnection(QWidget):
         le_label.setPlaceholderText("Ej: 8K IVGM")
         self.tbl_inverters.setCellWidget(row, 1, le_label)
 
-        cb_map = QComboBox()
-        for key, mapa in MAPS.items():
-            cb_map.addItem(mapa.label, key)
-        cb_map.setCurrentIndex(max(0, cb_map.findData(map_name)))
-        cb_map.setToolTip(
-            "Mapa de registros que define cómo se interpretan los datos "
-            "de este inversor."
+        cb_profile = QComboBox()
+        perfiles = self.profile_manager.profiles if self.profile_manager else []
+        for i, perfil in enumerate(perfiles):
+            mapa = getattr(perfil, 'register_map', 'classic')
+            cb_profile.addItem(f"{perfil.name}  [{mapa}]", i)
+        cb_profile.setCurrentIndex(max(0, self._profile_index_for_map(map_name)))
+        cb_profile.setToolTip(
+            "Perfil del inversor: define el modelo, la batería y el mapa "
+            "de registros que se usa para interpretar sus datos."
         )
-        self.tbl_inverters.setCellWidget(row, 2, cb_map)
+        self.tbl_inverters.setCellWidget(row, 2, cb_profile)
 
     def _remove_inverter_row(self):
         """Quita la fila seleccionada de la tabla de inversores."""
@@ -512,13 +560,13 @@ class TabConnection(QWidget):
         for row in range(self.tbl_inverters.rowCount()):
             sp_id = self.tbl_inverters.cellWidget(row, 0)
             le_label = self.tbl_inverters.cellWidget(row, 1)
-            cb_map = self.tbl_inverters.cellWidget(row, 2)
-            if sp_id is None or cb_map is None:
+            cb_profile = self.tbl_inverters.cellWidget(row, 2)
+            if sp_id is None or cb_profile is None:
                 continue
             entries.append(InverterEntry(
                 slave_id=sp_id.value(),
                 label=le_label.text().strip() if le_label else "",
-                map_name=cb_map.currentData() or "classic",
+                map_name=self._map_for_profile_index(cb_profile.currentIndex()),
             ))
 
         total = len(entries) if entries else 1
@@ -2534,13 +2582,16 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(header_row)
 
         self.tabs = QTabWidget()
-        self.tab_conn = TabConnection()
+        self.tab_conn = TabConnection(self._profile_manager)
         self.tab_monitor = TabMonitor()
         self.tab_parallel = TabParallelSystem()
         self.tab_settings = TabSettings()
         self.tab_control = TabControl()
         self.tab_scanner = TabScanner()
         self.tab_profiles = TabProfiles(self._profile_manager)
+        # Si se agregan/borran/editan perfiles, la tabla multi-inversor se actualiza
+        self.tab_profiles.profile_changed.connect(self.tab_conn.refresh_profile_choices)
+        self.tab_profiles.profiles_changed.connect(self.tab_conn.refresh_profile_choices)
         self.tab_api = TabAPI()
 
         self.tabs.addTab(self.tab_conn, "Conexión")
