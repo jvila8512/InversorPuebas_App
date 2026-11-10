@@ -20,13 +20,14 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 from core.felicity_modbus import ModbusStatus, WorkingMode
 from core.register_maps import MAPS, get_map
+from core.app_paths import data_file
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURACIÓN MULTI-INVERSOR
 # ══════════════════════════════════════════════════════════════════════════════
 
-CONFIG_FILE = os.path.join(os.path.dirname(__file__), '..', 'multi_inverter.json')
+CONFIG_FILE = data_file("multi_inverter.json")
 
 
 @dataclass
