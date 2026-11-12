@@ -189,6 +189,11 @@ class TabConnection(QWidget):
     disconnect_requested = pyqtSignal()
     autodetect_requested = pyqtSignal(str)
     multi_config_changed = pyqtSignal(bool)  # enabled True/False
+    # Configuración de paralelo del IVGM-8K:
+    #   parallel_config_requested  → (tipo_conexion, params)
+    #   parallel_id_assign_requested → (tipo_conexion, params, nuevo_id)
+    parallel_config_requested = pyqtSignal(str, dict)
+    parallel_id_assign_requested = pyqtSignal(str, dict, int)
 
     def __init__(self, profile_manager=None):
         super().__init__()
@@ -218,7 +223,7 @@ class TabConnection(QWidget):
             "• Mapa clásico: estado 0x1100-0x112A, config 0x211F-0x2159\n"
             "• Mapa IVGM-8K: estado 0x1100-0x1177 (Series RS485)\n"
             "• Funciones: Read Holding (0x03), Write Single (0x06)\n"
-            "• Framing TCP: Modbus TCP (MBAP) o RTU tunnelled"
+                "• Framing TCP: RTU tunnelled (por defecto), Auto o Modbus TCP (MBAP)"
         )
         lbl_info.setStyleSheet("color:#888; font-size:11px; font-family: 'Courier New';")
         info_layout.addWidget(lbl_info)
@@ -299,12 +304,15 @@ class TabConnection(QWidget):
 
         gtcp.addWidget(QLabel("Framing:"), 3, 0)
         self.cb_framing = QComboBox()
-        self.cb_framing.addItem("Modbus TCP (MBAP) — conversores de campo", "mbap")
         self.cb_framing.addItem("RTU tunnelled — gateway transparente", "rtu")
+        self.cb_framing.addItem("Auto — detectar (RTU y luego MBAP)", "auto")
+        self.cb_framing.addItem("Modbus TCP (MBAP) — conversores de campo", "mbap")
         self.cb_framing.setToolTip(
+            "RTU: el gateway pasa los bytes RTU crudos (modo transparente).\n"
+            "Es el modo del gateway usado con el IVGM-8K (slave 1).\n"
+            "Auto: prueba RTU y, si no responde, MBAP.\n"
             "MBAP: el gateway recibe Modbus TCP con cabecera MBAP\n"
-            "(modo 'Modbus TCP To RTU' de Waveshare/USR/Moxa).\n"
-            "RTU: el gateway pasa los bytes RTU crudos (modo transparente)."
+            "(modo 'Modbus TCP To RTU' de Waveshare/USR/Moxa)."
         )
         gtcp.addWidget(self.cb_framing, 3, 1)
 
@@ -312,13 +320,16 @@ class TabConnection(QWidget):
         self.sp_slave_id = QSpinBox()
         self.sp_slave_id.setRange(1, 247)
         self.sp_slave_id.setValue(1)
-        self.sp_slave_id.setToolTip("ID Modbus del inversor (1-247)")
+        self.sp_slave_id.setToolTip(
+            "ID Modbus del inversor (1-247).\n"
+            "En paralelo, cada inversor debe tener un ID distinto (0x2142)."
+        )
         gtcp.addWidget(self.sp_slave_id, 4, 1)
 
         lbl_tcp_note = QLabel(
             "Usá un gateway RS232/RS485→TCP (Waveshare, USR-TCP232, Moxa NPort, etc.)\n"
-            "MBAP: el gateway opera en 'Modbus TCP To RTU' (8N1, 9600 para IVGM).\n"
-            "RTU: el gateway opera en modo transparente / passthrough."
+            "RTU: el gateway opera en modo transparente / passthrough (8N1, 9600 para IVGM).\n"
+            "MBAP: el gateway opera en 'Modbus TCP To RTU'."
         )
         lbl_tcp_note.setStyleSheet("color:#888; font-size:10px;")
         gtcp.addWidget(lbl_tcp_note, 5, 0, 1, 2)
@@ -400,6 +411,61 @@ class TabConnection(QWidget):
         gm.addWidget(lbl_multi_note)
 
         layout.addWidget(self.grp_multi)
+
+        # ── Configuración de paralelo (IVGM-8K) ─────────────────────────
+        # En una instalación en paralelo, cada inversor debe tener un ID
+        # Modbus propio (registro 0x2142). De fábrica todos vienen en 1,
+        # así que hay que asignarles 1, 2, 3 conectándose a cada uno por
+        # separado (cable directo al que se quiere configurar).
+        self.grp_parallel = QGroupBox("Configuración de paralelo (IVGM-8K)")
+        gp = QGridLayout(self.grp_parallel)
+
+        self.btn_read_parallel = QPushButton("Leer configuración")
+        self.btn_read_parallel.clicked.connect(self._on_read_parallel)
+        gp.addWidget(self.btn_read_parallel, 0, 0)
+
+        self.lbl_par_count = QLabel("—")
+        self.lbl_par_addr = QLabel("—")
+        self.lbl_par_modbus = QLabel("—")
+        self.lbl_par_power = QLabel("—")
+        for col, (title, widget) in enumerate((
+            ("Inversores en paralelo:", self.lbl_par_count),
+            ("Rol (direcc. de paralelo):", self.lbl_par_addr),
+            ("Modbus ID actual (0x2142):", self.lbl_par_modbus),
+            ("Potencia nominal:", self.lbl_par_power),
+        ), start=1):
+            lbl = QLabel(title)
+            lbl.setStyleSheet("color:#888; font-size:10px;")
+            gp.addWidget(lbl, 0, col)
+            gp.addWidget(widget, 1, col)
+
+        gp.addWidget(QLabel("Asignar Modbus ID:"), 2, 0)
+        self.sp_par_modbus = QSpinBox()
+        self.sp_par_modbus.setRange(1, 247)
+        self.sp_par_modbus.setValue(1)
+        self.sp_par_modbus.setToolTip(
+            "Nuevo ID Modbus para el inversor conectado (1-247).\n"
+            "Conectate a cada inversor por separado y asignale su ID:\n"
+            "maestro = 1, esclavo 2 = 2, esclavo 3 = 3."
+        )
+        gp.addWidget(self.sp_par_modbus, 2, 1)
+
+        self.btn_set_parallel = QPushButton("Asignar ID")
+        self.btn_set_parallel.clicked.connect(self._on_set_parallel)
+        self.btn_set_parallel.setToolTip(
+            "Escribe el ID en el registro 0x2142 del inversor conectado.\n"
+            "⚠ Escribí en el inversor correcto: es un ajuste de fábrica."
+        )
+        gp.addWidget(self.btn_set_parallel, 2, 2)
+
+        self.lbl_par_note = QLabel(
+            "⚠ Conectá un inversor por vez (cable directo) para asignarle su ID.\n"
+            "El ID debe coincidir con su rol: 1=maestro, 2 y 3=esclavos."
+        )
+        self.lbl_par_note.setStyleSheet("color:#f39c12; font-size:10px;")
+        gp.addWidget(self.lbl_par_note, 3, 0, 1, 4)
+
+        layout.addWidget(self.grp_parallel)
 
         # Inicializar estado de controles multi-inversor
         self._add_inverter_row(1, "5K existente", "classic")
@@ -606,7 +672,7 @@ class TabConnection(QWidget):
             'host': self.le_tcp_host.text().strip(),
             'port': self.sp_tcp_port.value(),
             'timeout': self.sp_tcp_timeout.value(),
-            'framing': self.cb_framing.currentData() or "mbap",
+            'framing': self.cb_framing.currentData() or "rtu",
             'slave_id': self.sp_slave_id.value(),
         }
 
@@ -622,6 +688,40 @@ class TabConnection(QWidget):
             if not host:
                 return
             self.connect_requested.emit("tcp", self._get_tcp_config())
+
+    def _on_read_parallel(self):
+        """Pide leer la configuración de paralelo (0x2140-0x2143)."""
+        conn_type = self.get_connection_type()
+        if conn_type == "serial":
+            config = self._get_serial_config()
+        else:
+            config = self._get_tcp_config()
+        self.parallel_config_requested.emit(conn_type, config)
+
+    def _on_set_parallel(self):
+        """Pide asignar un nuevo Modbus ID (0x2142) al inversor conectado."""
+        new_id = self.sp_par_modbus.value()
+        conn_type = self.get_connection_type()
+        if conn_type == "serial":
+            config = self._get_serial_config()
+        else:
+            config = self._get_tcp_config()
+        self.parallel_id_assign_requested.emit(conn_type, config, new_id)
+
+    def show_parallel_config(self, count, address, modbus_id, rated_power):
+        """Muestra la configuración de paralelo leída del equipo."""
+        self.lbl_par_count.setText(str(count) if count else "—")
+        self.lbl_par_addr.setText(str(address) if address else "—")
+        self.lbl_par_modbus.setText(str(modbus_id) if modbus_id else "—")
+        if rated_power:
+            self.lbl_par_power.setText(f"{rated_power / 1000:.1f} kW")
+        else:
+            self.lbl_par_power.setText("—")
+
+    def set_parallel_status(self, text, color="#888"):
+        """Muestra el resultado de la última operación de paralelo."""
+        self.lbl_par_note.setText(text)
+        self.lbl_par_note.setStyleSheet(f"color:{color}; font-size:10px;")
 
     def _on_autodetect(self):
         port = self.cb_port.currentText()
@@ -1142,11 +1242,12 @@ class TabParallelSystem(QWidget):
         gt = QVBoxLayout(grp_table)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(9)
+        self.table.setColumnCount(14)
         self.table.setHorizontalHeaderLabels([
             "ID", "Estado", "Modo", "V.Bat (V)",
-            "I.Bat (A)", "P.Bat (W)", "P.AC (W)",
-            "V.AC (V)", "Fallo"
+            "I.Bat (A)", "P.Bat (W)", "SOC (%)",
+            "P.AC (W)", "V.AC (V)", "PV1 (V)", "P.PV (W)",
+            "T.Inv (°C)", "T.Amb (°C)", "Fallo"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setAlternatingRowColors(True)
@@ -1304,21 +1405,54 @@ class TabParallelSystem(QWidget):
             # P.AC
             ac_p = QTableWidgetItem(f"{inv.output_active_power:.0f}" if inv.is_online else "—")
             ac_p.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, 6, ac_p)
+            self.table.setItem(row, 7, ac_p)
 
             # V.AC
             ac_v = QTableWidgetItem(f"{inv.output_voltage:.1f}" if inv.is_online else "—")
             ac_v.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, 7, ac_v)
+            self.table.setItem(row, 8, ac_v)
+
+            # SOC
+            soc_item = QTableWidgetItem(
+                f"{inv.battery_soc:.0f}" if inv.is_online else "—"
+            )
+            soc_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 6, soc_item)
+
+            # PV1 (V) y P.PV (W)
+            pv1_item = QTableWidgetItem(
+                f"{inv.pv1_voltage:.1f}" if inv.is_online else "—"
+            )
+            pv1_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 9, pv1_item)
+
+            pvp_item = QTableWidgetItem(
+                f"{inv.pv_power:.0f}" if inv.is_online else "—"
+            )
+            pvp_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 10, pvp_item)
+
+            # Temperaturas del inversor y del ambiente
+            t_inv = QTableWidgetItem(
+                f"{inv.inverter_temp:.0f}" if inv.is_online else "—"
+            )
+            t_inv.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 11, t_inv)
+
+            t_amb = QTableWidgetItem(
+                f"{inv.ambient_temp:.0f}" if inv.is_online else "—"
+            )
+            t_amb.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 12, t_amb)
 
             # Fallo
             fault_item = QTableWidgetItem(inv.fault_description)
             fault_item.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, 8, fault_item)
+            self.table.setItem(row, 13, fault_item)
 
             # Color de fondo según estado
             bg = STATUS_BG.get(inv.status, "#1a1a1a")
-            for col in range(9):
+            for col in range(14):
                 item = self.table.item(row, col)
                 if item:
                     item.setBackground(QColor(bg))
@@ -2612,6 +2746,8 @@ class MainWindow(QMainWindow):
         self.tab_monitor.poll_interval_changed.connect(self._on_interval_changed)
         self.tab_parallel.navigate_to_inverter.connect(self._on_navigate_to_inverter)
         self.tab_conn.multi_config_changed.connect(self._on_multi_config_changed)
+        self.tab_conn.parallel_config_requested.connect(self._on_read_parallel_config)
+        self.tab_conn.parallel_id_assign_requested.connect(self._on_assign_parallel_id)
 
     def _build_status_bar(self):
         self.statusBar().showMessage("Listo · Protocolo: Modbus RTU · RS232 / TCP + Scanner")
@@ -2632,7 +2768,7 @@ class MainWindow(QMainWindow):
                 host = config.get('host', '')
                 port = config.get('port', 502)
                 timeout = config.get('timeout', 5.0)
-                framing = config.get('framing', 'mbap')
+                framing = config.get('framing', 'rtu')
                 slave_id = config.get('slave_id', 1)
                 if not host:
                     self.tab_conn.log("⚠ Dirección IP vacía", '#f39c12')
@@ -2871,6 +3007,149 @@ class MainWindow(QMainWindow):
             self.tab_parallel.update_table(placeholders)
         else:
             self.tab_conn.log("⚙ Modo multi-inversor deshabilitado", '#888')
+
+    # ── Configuración de paralelo del IVGM-8K (0x2140-0x2143) ───────────
+
+    def _parallel_map(self):
+        """
+        Mapa a usar para leer/escribir la configuración de paralelo.
+
+        El bloque 0x2140-0x2143 (cantidad en paralelo, dirección de
+        paralelo, Modbus ID y potencia nominal) es propio de la serie
+        IVGM-8K, así que se usa siempre ese mapa.
+        """
+        from core.register_maps import get_map
+        return get_map("ivgm_8k")
+
+    def _open_temp_connection(self, conn_type: str, config: dict):
+        """
+        Abre una conexión temporal para leer o escribir la configuración
+        de paralelo. Reutiliza la conexión activa si ya existe.
+        """
+        if self._conn is not None and getattr(self._conn, "is_open", False):
+            return self._conn, False
+
+        if conn_type == "tcp":
+            host = config.get("host", "").strip()
+            if not host:
+                return None, False
+            conn = ModbusTCPConnection(
+                host,
+                config.get("port", 502),
+                config.get("timeout", 5.0),
+                config.get("slave_id", 1),
+                config.get("framing", "rtu"),
+            )
+        else:
+            port = config.get("port", "")
+            if not port or port == "(sin puertos)":
+                return None, False
+            serial_config = {k: v for k, v in config.items() if k != "port"}
+            conn = ModbusConnection(port, serial_config, config.get("slave_id", 1))
+
+        ok, _msg = conn.connect()
+        if not ok:
+            return None, False
+        return conn, True
+
+    def _on_read_parallel_config(self, conn_type: str, config: dict):
+        """Lee la configuración de paralelo (0x2140-0x2143) del inversor."""
+        conn, temporary = self._open_temp_connection(conn_type, config)
+        if conn is None:
+            self.tab_conn.set_parallel_status(
+                "✖ No se pudo conectar para leer la configuración", '#e94560'
+            )
+            return
+        try:
+            mapa = self._parallel_map()
+            conn.set_map(mapa)
+            settings = conn.read_settings(mapa)
+            if settings is None:
+                self.tab_conn.set_parallel_status(
+                    "✖ El equipo no devolvió el bloque 0x2140-0x2143", '#e94560'
+                )
+                return
+            self.tab_conn.show_parallel_config(
+                settings.parallel_count,
+                settings.parallel_address,
+                settings.modbus_id,
+                settings.rated_power,
+            )
+            rol = settings.parallel_role_str
+            self.tab_conn.set_parallel_status(
+                f"✓ {settings.parallel_count} inversor(es) en paralelo · "
+                f"rol: {rol} · ID Modbus: {settings.modbus_id}",
+                '#27ae60',
+            )
+            self.tab_conn.log(
+                f"⚙ Config de paralelo: {settings.parallel_count} en paralelo, "
+                f"dirección {settings.parallel_address} ({rol}), "
+                f"Modbus ID {settings.modbus_id}, "
+                f"{settings.rated_power / 1000:.1f} kW",
+                '#9b59b6',
+            )
+        except Exception as e:
+            self.tab_conn.set_parallel_status(f"✖ Error: {e}", '#e94560')
+        finally:
+            if temporary and conn is not None:
+                conn.disconnect()
+
+    def _on_assign_parallel_id(self, conn_type: str, config: dict, new_id: int):
+        """Escribe el nuevo Modbus ID (0x2142) en el inversor conectado."""
+        conn, temporary = self._open_temp_connection(conn_type, config)
+        if conn is None:
+            self.tab_conn.set_parallel_status(
+                "✖ No se pudo conectar para asignar el ID", '#e94560'
+            )
+            return
+        try:
+            mapa = self._parallel_map()
+            if not mapa.settings_fields:
+                self.tab_conn.set_parallel_status(
+                    "✖ El mapa seleccionado no define el bloque 0x2140-0x2143",
+                    '#e94560',
+                )
+                return
+            conn.set_map(mapa)
+
+            # Verificamos primero a qué ID responde el equipo ahora mismo.
+            actual = conn.read_settings(mapa)
+            id_actual = actual.modbus_id if actual else 0
+            if actual is None:
+                self.tab_conn.set_parallel_status(
+                    "✖ El inversor no respondió — revisá el cableado", '#e94560'
+                )
+                return
+            if id_actual == new_id:
+                self.tab_conn.set_parallel_status(
+                    f"• Ya tiene el ID {new_id}. No se escribe nada.", '#f39c12'
+                )
+                return
+
+            result = conn.write_single_register(0x2142, new_id)
+            if result.success:
+                self.tab_conn.show_parallel_config(
+                    actual.parallel_count, actual.parallel_address,
+                    new_id, actual.rated_power,
+                )
+                self.tab_conn.set_parallel_status(
+                    f"✓ Modbus ID cambiado de {id_actual} a {new_id}. "
+                    f"Ahora el equipo responde en el ID {new_id}.",
+                    '#27ae60',
+                )
+                self.tab_conn.log(
+                    f"✓ Modbus ID del inversor cambiado: {id_actual} → {new_id}",
+                    '#27ae60',
+                )
+            else:
+                self.tab_conn.set_parallel_status(
+                    f"✖ No se pudo escribir: {result.message}", '#e94560'
+                )
+        except Exception as e:
+            self.tab_conn.set_parallel_status(f"✖ Error: {e}", '#e94560')
+        finally:
+            if temporary and conn is not None:
+                conn.disconnect()
 
     def _show_parallel_tab(self, show: bool):
         """Muestra u oculta la pestaña 'Sistema en Paralelo'."""
