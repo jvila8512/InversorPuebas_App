@@ -1,12 +1,25 @@
 """
 modbus_tcp.py — Transporte Modbus sobre TCP/IP
-===============================================================
+===============================================
 Para usar con gateways RS485→TCP (USR-TCP232, Moxa NPort, etc).
 
 Dos framings soportados:
-  - "mbap" (por defecto): Modbus TCP estándar. Trama MBAP de 7 bytes
-    (txid + protocol id + length + unit id) + PDU, SIN CRC.
-  - "rtu": trama RTU cruda (unit + PDU + CRC) tunelada por TCP.
+  - "rtu" (por defecto): trama RTU cruda (unit + PDU + CRC) tunelada por
+    TCP. Es el modo que usan los gateways configurados como "Serial server"
+    o "transparente", que es el caso del gateway usado con el IVGM-8K.
+  - "mbap": Modbus TCP estándar. Trama MBAP de 7 bytes
+    (txid + protocol id + length + unit id) + PDU, SIN CRC. Es el modo
+    "Modbus TCP To RTU" de los gateways de campo.
+  - "auto": prueba RTU y, si no responde, MBAP. Se fija en el que funcione.
+
+Ruido del gateway
+-----------------
+Algunos gateways (p. ej. los USR-D164 con pantalla táctil) envían un banner
+ASCII al abrir la conexión ("Scan:x[0]:180,...") ANTES de la primera trama
+Modbus. Ese banner no es una respuesta válida y hay que descartarlo: la
+primera lectura de la sesión arrive corrupta. Por eso el lector de este
+módulo busca una trama Modbus válida dentro del flujo recibido en lugar de
+asumir que la respuesta empieza en el primer byte.
 
 La interfaz es compatible con ModbusConnection (felicity_modbus.py).
 """
@@ -36,11 +49,13 @@ from core.register_maps import (
     CLASSIC_MAP,
     RegisterMap,
     decode_status_fields,
+    decode_settings_fields,
     get_map,
 )
 
 
 logger = logging.getLogger(__name__)
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -74,7 +89,7 @@ class ModbusTCPConnection:
         port: int = None,
         timeout: float = None,
         slave_id: int = 1,
-        framing: str = "mbap",
+        framing: str = "rtu",
     ):
         self.host = host
         self.port = port or self.DEFAULT_TCP_PORT
@@ -87,8 +102,8 @@ class ModbusTCPConnection:
 
     @staticmethod
     def _validate_framing(framing: str) -> str:
-        framing = (framing or "mbap").lower()
-        if framing not in ("mbap", "rtu"):
+        framing = (framing or "rtu").lower()
+        if framing not in ("mbap", "rtu", "auto"):
             raise ValueError(f"Framing no soportado: {framing}")
         return framing
 
@@ -206,63 +221,191 @@ class ModbusTCPConnection:
         if not self.is_open:
             return None
 
-        for attempt in range(MAX_RETRIES):
+        # En modo "auto" se prueba RTU primero (modo del gateway en modo
+        # transparente) y, si no responde, MBAP.
+        framings = ("rtu", "mbap") if self.framing == "auto" else (self.framing,)
+        detected: Optional[str] = None
+        registers: Optional[list] = None
+
+        for framing in framings:
+            previous = self.framing
+            self.framing = framing
             try:
-                frame = self._build_read_frame(start_address, count)
-                self._socket.sendall(bytes(frame))
+                for _attempt in range(MAX_RETRIES):
+                    try:
+                        # Descarta residuos (banner ASCII del gateway o
+                        # respuestas viejas) ANTES de enviar la petición.
+                        self._drain()
+                        frame = self._build_read_frame(start_address, count)
+                        self._socket.sendall(bytes(frame))
 
-                response = self._read_response(count)
-                if response is None:
-                    continue
+                        response = self._read_response(count)
+                        if response is None:
+                            continue
 
-                registers = self._parse_read_response(response, count)
-                if registers is not None:
-                    return registers
+                        registers = self._parse_read_response(response, count)
+                        if registers is not None:
+                            detected = framing
+                            break
+                    except (socket.timeout, OSError):
+                        continue
+                if detected:
+                    break
+            finally:
+                self.framing = previous
 
-            except (socket.timeout, OSError):
-                continue
+        if detected and self.framing == "auto":
+            self.framing = detected
+            logger.info("Framing detectado automáticamente: %s", detected.upper())
 
-        return None
+        return registers
+
+    def _drain(self) -> int:
+        """
+        Descarta los bytes pendientes del socket.
+
+        Los gateways con pantalla táctil envían un banner ASCII al abrir la
+        conexión. Ese banner contaminaría la primera lectura, así que se
+        descarta antes de cada petición.
+        """
+        if not self._socket:
+            return 0
+
+        discarded = 0
+        previous_timeout = self._socket.gettimeout()
+        try:
+            self._socket.settimeout(0.05)
+            while True:
+                chunk = self._socket.recv(4096)
+                if not chunk:
+                    break
+                discarded += len(chunk)
+        except (socket.timeout, BlockingIOError, OSError):
+            pass
+        finally:
+            try:
+                self._socket.settimeout(
+                    previous_timeout if previous_timeout is not None else self.timeout
+                )
+            except OSError:
+                pass
+
+        if discarded:
+            logger.debug("Descartados %d bytes residuales del gateway", discarded)
+        return discarded
 
     def _expected_read_bytes(self, count: int) -> int:
         if self.framing == "mbap":
             return 9 + (count * 2)  # MBAP(7) + func(1) + bytecount(1) + data
         return 5 + (count * 2)      # unit(1) + func(1) + bytecount(1) + data + crc(2)
 
+    def _frame_length(self, count: int) -> int:
+        """Longitud total de la trama de lectura esperada."""
+        return self._expected_read_bytes(count)
+
+    def _find_frame(
+        self,
+        buffer: bytes,
+        expected_count: int,
+        function: int = FUNCTION_READ_HOLDING,
+        total: Optional[int] = None,
+    ) -> Optional[tuple]:
+        """
+        Busca una trama Modbus válida dentro de `buffer`.
+
+        Devuelve (desplazamiento, longitud) de la trama, o None si todavía
+        no hay una completa. Descarta el ruido previo (banner ASCII).
+        """
+        if len(buffer) < 5:
+            return None
+
+        if total is None:
+            total = 5 + (expected_count * 2) if function == FUNCTION_READ_HOLDING \
+                else (12 if self.framing == "mbap" else 8)
+
+        if self.framing == "mbap":
+            for i in range(0, len(buffer) - 8):
+                if buffer[i + 2:i + 4] != b"\x00\x00":
+                    continue
+                if buffer[i + 6] != self.slave_id:
+                    continue
+                func = buffer[i + 7]
+                if func & 0x80:                      # respuesta de excepción
+                    if len(buffer) >= i + 9:
+                        return (i, 9)
+                    continue
+                if func != function:
+                    continue
+                if function == FUNCTION_READ_HOLDING:
+                    if len(buffer) < i + 9:
+                        return None
+                    byte_count = buffer[i + 8]
+                    if byte_count != expected_count * 2:
+                        continue
+                    total = 9 + byte_count
+                if len(buffer) < i + total:
+                    return None
+                return (i, total)
+            return None
+
+        # ── RTU ──────────────────────────────────────────────────────────
+        for i in range(0, len(buffer) - 4):
+            if buffer[i] != self.slave_id:
+                continue
+            if len(buffer) < i + 3:
+                return None
+            func = buffer[i + 1]
+            if func & 0x80:                          # respuesta de excepción
+                if len(buffer) >= i + 5 and verify_crc(bytes(buffer[i:i + 5])):
+                    return (i, 5)
+                continue
+            if func != function:
+                continue
+            if function == FUNCTION_READ_HOLDING:
+                byte_count = buffer[i + 2]
+                if byte_count != expected_count * 2:
+                    continue
+                total = 5 + (expected_count * 2)
+            if len(buffer) < i + total:
+                return None
+            if verify_crc(bytes(buffer[i:i + total])):
+                return (i, total)
+            # CRC inválido: puede ser que el inicio real esté más adelante.
+        return None
+
     def _read_response(self, expected_count: int) -> Optional[bytes]:
         """
         Lee la respuesta del gateway via TCP.
-        A diferencia del serial, TCP garantiza entrega o error.
+
+        A diferencia del serial, TCP garantiza entrega o error, pero el
+        flujo puede traer ruido (banner del gateway) antes de la trama.
+        Se acumula hasta encontrar una trama Modbus válida.
         """
         if not self._socket:
             return None
 
-        expected_bytes = self._expected_read_bytes(expected_count)
         buffer = bytearray()
         start_time = time.perf_counter()
 
-        while len(buffer) < expected_bytes:
+        while True:
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             if elapsed_ms > READ_TIMEOUT_MS:
-                if len(buffer) >= 5:
-                    break
                 return None
 
+            found = self._find_frame(bytes(buffer), expected_count)
+            if found is not None:
+                offset, total = found
+                return bytes(buffer[offset:offset + total])
+
             try:
-                remaining = expected_bytes - len(buffer)
-                chunk = self._socket.recv(min(remaining, self.RECV_BUFFER_SIZE))
-                if chunk:
-                    buffer.extend(chunk)
-                else:
+                chunk = self._socket.recv(self.RECV_BUFFER_SIZE)
+                if not chunk:
                     return None
+                buffer.extend(chunk)
             except socket.timeout:
-                if len(buffer) >= 5:
-                    break
                 return None
             except OSError:
                 return None
-
-        return bytes(buffer) if buffer else None
 
     def _parse_read_response(self, response: bytes, count: int) -> Optional[list]:
         """Interpreta una respuesta de lectura según el framing activo."""
@@ -334,11 +477,11 @@ class ModbusTCPConnection:
         start_time = time.perf_counter()
 
         try:
+            self._drain()
             frame = self._build_write_frame(register_address, value)
             self._socket.sendall(bytes(frame))
 
-            expected = 12 if self.framing == "mbap" else 8
-            response = self._recv_exact(expected)
+            response = self._read_write_response()
 
             latency = (time.perf_counter() - start_time) * 1000
 
@@ -391,6 +534,39 @@ class ModbusTCPConnection:
         except (socket.timeout, OSError) as e:
             latency = (time.perf_counter() - start_time) * 1000
             return WriteResult(False, register_address, value, latency, str(e))
+
+    def _read_write_response(self) -> Optional[bytes]:
+        """
+        Lee la respuesta a una escritura (función 0x06) tolerando ruido
+        previo del gateway (banner ASCII).
+        """
+        if not self._socket:
+            return None
+
+        buffer = bytearray()
+        start_time = time.perf_counter()
+
+        while True:
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            if elapsed_ms > READ_TIMEOUT_MS:
+                return None
+
+            found = self._find_frame(
+                bytes(buffer), 0, function=FUNCTION_WRITE_SINGLE
+            )
+            if found is not None:
+                offset, total = found
+                return bytes(buffer[offset:offset + total])
+
+            try:
+                chunk = self._socket.recv(self.RECV_BUFFER_SIZE)
+                if not chunk:
+                    return None
+                buffer.extend(chunk)
+            except socket.timeout:
+                return None
+            except OSError:
+                return None
 
     def _recv_exact(self, num_bytes: int) -> Optional[bytes]:
         """Lee exactamente num_bytes del socket o None si falla."""
@@ -492,6 +668,31 @@ class ModbusTCPConnection:
         status.pv_voltage = round(float(decoded.get("pv_voltage", 0.0)), 1)
         status.pv_power = int(decoded.get("pv_power", 0))
 
+        # ── Campos propios del mapa (IVGM-8K y compañía) ───────────────
+        status.pv1_voltage = round(float(decoded.get("pv1_voltage", 0.0)), 1)
+        status.pv2_voltage = round(float(decoded.get("pv2_voltage", 0.0)), 1)
+        status.pv1_current = round(float(decoded.get("pv1_current", 0.0)), 2)
+        status.pv2_current = round(float(decoded.get("pv2_current", 0.0)), 2)
+        status.pv1_power = int(decoded.get("pv1_power", 0))
+        status.pv2_power = int(decoded.get("pv2_power", 0))
+        status.output_frequency = round(float(decoded.get("output_frequency", 0.0)), 2)
+        status.output_voltage_a = round(float(decoded.get("output_voltage_a", 0.0)), 1)
+        status.output_voltage_b = round(float(decoded.get("output_voltage_b", 0.0)), 1)
+        status.boost_temp = int(round(decoded.get("boost_temp", 0.0)))
+        status.inverter_temp = int(round(decoded.get("inverter_temp", 0.0)))
+        status.ambient_temp = int(round(decoded.get("ambient_temp", 0.0)))
+        status.battery_temp = round(float(decoded.get("battery_temp", 0.0)), 1)
+        status.grid_a_voltage = round(float(decoded.get("grid_a_voltage", 0.0)), 1)
+        status.grid_b_voltage = round(float(decoded.get("grid_b_voltage", 0.0)), 1)
+        status.inverter_a_voltage = round(float(decoded.get("inverter_a_voltage", 0.0)), 1)
+        status.inverter_b_voltage = round(float(decoded.get("inverter_b_voltage", 0.0)), 1)
+        status.load_a_voltage = round(float(decoded.get("load_a_voltage", 0.0)), 1)
+        status.load_b_voltage = round(float(decoded.get("load_b_voltage", 0.0)), 1)
+        status.load_a_current = round(float(decoded.get("load_a_current", 0.0)), 2)
+        status.load_b_current = round(float(decoded.get("load_b_current", 0.0)), 2)
+        status.inverter_frequency = round(float(decoded.get("inverter_frequency", 0.0)), 2)
+        status.load_frequency = round(float(decoded.get("load_frequency", 0.0)), 2)
+
         return status
 
     def read_settings(self, map=None) -> Optional[ModbusSettings]:
@@ -514,6 +715,19 @@ class ModbusTCPConnection:
 
         settings = ModbusSettings()
         settings.raw_registers = list(regs)
+
+        # ── Mapas con bloque de ajustes propio (ej. IVGM-8K) ──────────
+        # El layout se describe en map.settings_fields, así que no se
+        # aplican los offsets fijos del mapa clásico.
+        if map_obj.settings_fields:
+            decoded = decode_settings_fields(
+                regs, map_obj.settings_start, map_obj
+            )
+            settings.parallel_count = int(decoded.get("parallel_count", 0))
+            settings.parallel_address = int(decoded.get("parallel_address", 0))
+            settings.modbus_id = int(decoded.get("modbus_id", 0))
+            settings.rated_power = int(decoded.get("rated_power", 0))
+            return settings
 
         # Offset 0 (0x211F): Battery cut-off voltage / 10
         settings.battery_cutoff_voltage = regs[0] / 10.0

@@ -167,6 +167,12 @@ class InverterData:
     grid_voltage: float = 0.0        # V AC
     grid_frequency: float = 0.0      # Hz
     load_percent: float = 0.0        # %
+    # Campos extra de la serie IVGM-8K (mapa "ivgm_8k")
+    pv1_voltage: float = 0.0         # 0x1118 — V
+    pv2_voltage: float = 0.0         # 0x1119 — V
+    inverter_temp: float = 0.0       # 0x1145 — °C
+    ambient_temp: float = 0.0        # 0x1146 — °C
+    battery_temp: float = 0.0        # 0x1147 — °C
     latency_ms: float = 0.0          # Latencia de esta lectura
     consecutive_timeouts: int = 0    # Timeouts seguidos
     last_seen: float = 0.0           # timestamp del último OK
@@ -415,6 +421,14 @@ class MultiInverterThread(QThread):
             inv_data.load_percent = status.load_percent
             inv_data.fault_code = status.fault_code
             inv_data.fault_description = decode_fault_code(status.fault_code)
+
+            # Campos extra de la serie IVGM-8K (0 si el mapa no los provee)
+            inv_data.pv1_voltage = getattr(status, "pv1_voltage", 0.0)
+            inv_data.pv2_voltage = getattr(status, "pv2_voltage", 0.0)
+            inv_data.inverter_temp = getattr(status, "inverter_temp", 0)
+            inv_data.ambient_temp = getattr(status, "ambient_temp", 0)
+            inv_data.battery_temp = getattr(status, "battery_temp", 0.0)
+
             inv_data.working_mode = decode_working_mode(
                 _get_working_mode_value(status)
             )

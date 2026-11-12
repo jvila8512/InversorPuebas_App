@@ -239,7 +239,11 @@ DEFAULT_PROFILES = [
         shutdown_v=44.0,
         output_priority="Solar First (solar primero)",
         charge_priority="Solar + Utility (ambos)",
-        notes="Mapa de registros IVGM-8K (Series RS485). RS485 a 9600 baud, 8N1.",
+        notes=(
+            "Mapa IVGM-8K (Series RS485) VALIDADO contra hardware real. "
+            "RS485 a 9600 baud, 8N1, slave 1 por defecto. "
+            "En paralelo, asignar un Modbus ID propio (0x2142) a cada unidad."
+        ),
     ),
     InverterProfile(
         name="Axpert 3K — AGM 24V",

@@ -28,6 +28,7 @@ import serial.tools.list_ports
 from core.register_maps import (
     CLASSIC_MAP,
     RegisterMap,
+    decode_settings_fields,
     decode_status_fields,
     get_map,
 )
@@ -162,6 +163,36 @@ class ModbusStatus:
     # ── Temperatura ──
     heatsink_temp: int = 0             # °C
 
+    # ── Campos específicos de la serie IVGM-8K (Series RS485) ──
+    pv1_voltage: float = 0.0           # 0x1118 — V
+    pv2_voltage: float = 0.0           # 0x1119 — V
+    pv1_current: float = 0.0           # 0x111C — A
+    pv2_current: float = 0.0           # 0x111D — A
+    pv1_power: int = 0                 # 0x1128 — W
+    pv2_power: int = 0                 # 0x1129 — W
+    output_frequency: float = 0.0      # 0x113E — Hz
+    output_voltage_a: float = 0.0      # 0x113F — V (fase A)
+    output_voltage_b: float = 0.0      # 0x1140 — V (fase B)
+    boost_temp: int = 0                # 0x1144 — °C
+    inverter_temp: int = 0             # 0x1145 — °C
+    ambient_temp: int = 0              # 0x1146 — °C
+    battery_temp: float = 0.0          # 0x1147 — °C
+    grid_a_voltage: float = 0.0        # 0x1150 — V
+    grid_b_voltage: float = 0.0        # 0x1151 — V
+    inverter_a_voltage: float = 0.0    # 0x1153 — V
+    inverter_b_voltage: float = 0.0    # 0x1154 — V
+    load_a_voltage: float = 0.0        # 0x1156 — V
+    load_b_voltage: float = 0.0        # 0x1157 — V
+    load_a_current: float = 0.0        # 0x1162 — A
+    load_b_current: float = 0.0        # 0x1163 — A
+    inverter_frequency: float = 0.0    # 0x116E — Hz
+    load_frequency: float = 0.0        # 0x116F — Hz
+
+    @property
+    def has_ivgm_telemetry(self) -> bool:
+        """True si el mapa cargado es de la serie IVGM-8K."""
+        return self.map_name == "ivgm_8k"
+
     # ── Propiedades derivadas de PowerFlowMsg (0x1104) ──
 
     @property
@@ -291,6 +322,21 @@ class ModbusSettings:
     over_temp_restart: bool = False     # 0x2134 — Sobretemperatura reinicio
     lcd_backlight: bool = False         # 0x2135 — Backlight LCD
     overload_to_bypass: bool = False    # 0x2137 — Sobrecarga → bypass
+
+    # ── Configuración de paralelo (IVGM-8K, 0x2140-0x2143) ──
+    parallel_count: int = 0          # 0x2140 — cuántos inversores hay en paralelo
+    parallel_address: int = 0        # 0x2141 — rol: 1=maestro, 2..N=esclavos
+    modbus_id: int = 0               # 0x2142 — ID Modbus (slave id) del inversor
+    rated_power: int = 0             # 0x2143 — potencia nominal en W
+
+    @property
+    def parallel_role_str(self) -> str:
+        """Describe el rol en paralelo a partir del número de dirección."""
+        if self.parallel_address <= 0:
+            return "—"
+        if self.parallel_address == 1:
+            return "Maestro"
+        return f"Esclavo {self.parallel_address - 1}"
 
     @property
     def ac_output_frequency_str(self) -> str:
@@ -754,6 +800,31 @@ class ModbusConnection:
         status.pv_voltage = round(float(decoded.get("pv_voltage", 0.0)), 1)
         status.pv_power = int(decoded.get("pv_power", 0))
 
+        # ── Campos propios del mapa (IVGM-8K y compañía) ───────────────
+        status.pv1_voltage = round(float(decoded.get("pv1_voltage", 0.0)), 1)
+        status.pv2_voltage = round(float(decoded.get("pv2_voltage", 0.0)), 1)
+        status.pv1_current = round(float(decoded.get("pv1_current", 0.0)), 2)
+        status.pv2_current = round(float(decoded.get("pv2_current", 0.0)), 2)
+        status.pv1_power = int(decoded.get("pv1_power", 0))
+        status.pv2_power = int(decoded.get("pv2_power", 0))
+        status.output_frequency = round(float(decoded.get("output_frequency", 0.0)), 2)
+        status.output_voltage_a = round(float(decoded.get("output_voltage_a", 0.0)), 1)
+        status.output_voltage_b = round(float(decoded.get("output_voltage_b", 0.0)), 1)
+        status.boost_temp = int(round(decoded.get("boost_temp", 0.0)))
+        status.inverter_temp = int(round(decoded.get("inverter_temp", 0.0)))
+        status.ambient_temp = int(round(decoded.get("ambient_temp", 0.0)))
+        status.battery_temp = round(float(decoded.get("battery_temp", 0.0)), 1)
+        status.grid_a_voltage = round(float(decoded.get("grid_a_voltage", 0.0)), 1)
+        status.grid_b_voltage = round(float(decoded.get("grid_b_voltage", 0.0)), 1)
+        status.inverter_a_voltage = round(float(decoded.get("inverter_a_voltage", 0.0)), 1)
+        status.inverter_b_voltage = round(float(decoded.get("inverter_b_voltage", 0.0)), 1)
+        status.load_a_voltage = round(float(decoded.get("load_a_voltage", 0.0)), 1)
+        status.load_b_voltage = round(float(decoded.get("load_b_voltage", 0.0)), 1)
+        status.load_a_current = round(float(decoded.get("load_a_current", 0.0)), 2)
+        status.load_b_current = round(float(decoded.get("load_b_current", 0.0)), 2)
+        status.inverter_frequency = round(float(decoded.get("inverter_frequency", 0.0)), 2)
+        status.load_frequency = round(float(decoded.get("load_frequency", 0.0)), 2)
+
         return status
 
     def read_settings(self, map=None) -> Optional[ModbusSettings]:
@@ -776,6 +847,19 @@ class ModbusConnection:
 
         settings = ModbusSettings()
         settings.raw_registers = list(regs)
+
+        # ── Mapas con bloque de ajustes propio (ej. IVGM-8K) ──────────
+        # El layout se describe en map.settings_fields, así que no se
+        # aplican los offsets fijos del mapa clásico.
+        if map_obj.settings_fields:
+            decoded = decode_settings_fields(
+                regs, map_obj.settings_start, map_obj
+            )
+            settings.parallel_count = int(decoded.get("parallel_count", 0))
+            settings.parallel_address = int(decoded.get("parallel_address", 0))
+            settings.modbus_id = int(decoded.get("modbus_id", 0))
+            settings.rated_power = int(decoded.get("rated_power", 0))
+            return settings
 
         # Los offsets son relativos al inicio del bloque de ajustes (0x211F
         # en el mapa clásico).
