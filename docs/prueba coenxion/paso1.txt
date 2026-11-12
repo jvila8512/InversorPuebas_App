@@ -1,0 +1,122 @@
+  Conectado a 192.168.1.10:502 (modo auto: se prueban RTU y MBAP)
+
+  AUTO: 160 combinaciones (framing x slave x funcion x direccion), peor caso ~128 s
+  Leyenda: OK=datos  EXC=excepcion (equipo vivo)  GW=el conversor avisa que el
+           inversor no responde  BAS=basura  -=silencio  ERR=error
+
+  [RTU]
+      TX 01 03 11 00 00 01 81 36
+      RX 53 63 61 6E 3A 78 5B 30 5D 3A 31 38 30 2C 79 5B 30 5D 3A 31 34 36 0D 0A 44 4F 57 4E 3A 78 5B 30 5D 3A 31 38 30 2C 79 5B 30 5D 3A 31 34 36 2C 74 69 63 6B 73 5F 64 6F 77 6E 0D 0A 50 52 45 53 53 0D 0A 54 6F 75 63 68 41 63 74 69 6F 6E 20 78 3A 31 38 30 20 79 3A 31 34 36 0D 0A 55 50 0D 0A 73 68 6F 72 74 31 0D 0A 53 48 4F 52 54 0D 0A 01 03 02 00 03 F8 45  -> BASURA (CRC invalido)
+      TX 01 03 F8 00 00 01 B5 6A
+      RX 01 03 02 01 51 78 28  -> OK
+    slave 1   03@1100=BAS 03@F800=OK
+
+  ENCONTRADO: el equipo responde con datos validos.
+     framing = rtu   slave = 1   funcion = 3   direccion = 0xF800
+  Para repetirlo:
+     python verificar_rs485_v2.py --host 192.168.1.10 --port 502 --framer rtu --slave 1 --fc 3 --start 0x1100 --count 80
+
+  Volcando 0x1100..0x114F (80 registros) en slave 1, FC03, RTU...
+      TX 01 03 11 00 00 3C 40 E7
+      RX 01 03 78 00 03 31 C6 40 74 EA 40 75 EA 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 02 10 00 00 00 00 00 00 00 00 00 00 00 00 0C 1E 01 81 00 00 00 00 00 6C 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 0D 28 00 00 00 00 00 00 02 1B 00 00 00 00 FD 84 02 5C 0C BE 00 00 00 00 09 1C 00 00 00 00 00 00 01 CC 00 00 00 00 00 00 81 27  -> OK
+    0x1100 +60  OK
+      TX 01 03 11 3C 00 14 80 F5
+      RX 01 03 28 00 00 00 00 13 40 09 AB 09 94 00 00 05 35 05 35 00 28 00 18 00 2A 00 FA D4 2C 00 02 00 01 00 01 00 00 00 14 00 17 00 00 74 41  -> OK
+    0x113C +20  OK
+
+  Registros leidos: 80/80
+
+  Direccion   Valor    Hex      classic     ivgm_8k     
+  ----------------------------------------------------
+  0x1100      3       0x0003   3           3           
+  0x1101      12742   0x31C6   12742       12742       
+  0x1102      16500   0x4074   16500       16500       
+  0x1103      59968   0xEA40   59968       59968       
+  0x1104      30186   0x75EA   30186       30186       
+  0x1108      0       0x0000   0.00V       -           
+  0x1109      0       0x0000   0A          0           
+  0x110A      0       0x0000   0W          0           
+  0x1111      528     0x0210   52.80V      -           
+  0x1117      0       0x0000   0.00V       -           
+  0x1118      3102    0x0C1E   -           310.20V     
+  0x1119      385     0x0181   3.85Hz      38.50V      
+  0x111C      108     0x006C   -           10.80A      
+  0x111D      0       0x0000   -           0.00A       
+  0x111E      0       0x0000   0W          -           
+  0x111F      0       0x0000   0VA         -           
+  0x1120      0       0x0000   0%          0W          
+  0x1121      0       0x0000   -           0W          
+  0x1126      0       0x0000   0.00V       -           
+  0x1128      3368    0x0D28   -           3368W       
+  0x1129      0       0x0000   -           0W          
+  0x112A      0       0x0000   0W          -           
+  0x112C      539     0x021B   -           53.90V      
+  0x112F      64900   0xFD84   -           -           
+  0x1130      604     0x025C   -           60.40A      
+  0x1131      3262    0x0CBE   -           3262W       
+  0x1134      2332    0x091C   -           -           
+  0x1138      460     0x01CC   -           46.00%      
+  0x113E      4928    0x1340   -           -           
+  0x113F      2475    0x09AB   -           -           
+  0x1140      2452    0x0994   -           -           
+  0x1142      1333    0x0535   -           -           
+  0x1143      1333    0x0535   -           -           
+  0x1144      40      0x0028   -           -           
+  0x1145      24      0x0018   -           -           
+  0x1146      42      0x002A   -           -           
+  0x1147      250     0x00FA   -           -           
+  0x1148      54316   0xD42C   -           -           
+  0x1149      2       0x0002   -           -           
+  0x114A      1       0x0001   -           -           
+  0x114B      1       0x0001   -           -           
+  0x114D      20      0x0014   -           -           
+  0x114E      23      0x0017   -           -           
+  (37 registros en 0 o sin lectura y sin mapa omitidos; use --full)
+
+  COMPARACION DE MAPAS
+  --------------------------------------------------------------
+  Campo               Clasico               IVGM-8K               
+  --------------------------------------------------------------
+  battery_current     0A                    60.40A                
+  battery_power       0W                    3262W                 
+  battery_soc                               46.00%                
+  battery_voltage     0.00V                 53.90V                
+  charge_mode         16500                                       
+  fault_code          59968                 0                     
+  grid_frequency      3.85Hz                                      
+  grid_voltage        0.00V                                       
+  load_a                                    0W                    
+  load_b                                    0W                    
+  load_percent        0%                                          
+  output_apparent     0VA                                         
+  output_power        0W                                          
+  output_voltage      52.80V                                      
+  power_flow          30186                                       
+  pv1_current                               10.80A                
+  pv1_power                                 3368W                 
+  pv1_voltage                               310.20V               
+  pv2_current                               0.00A                 
+  pv2_power                                 0W                    
+  pv2_voltage                               38.50V                
+  pv_power            0W                                          
+  pv_voltage          0.00V                                       
+  setting_data_sn     3                                           
+  state1                                    12742                 
+  state2                                    16500                 
+  state3                                    59968                 
+  state4                                    30186                 
+  warn_code                                 0                     
+  work_mode                                 3                     
+  working_mode        12742                                       
+
+  VEREDICTO
+  --------------------------------------------------------------
+  IVGM-8K: 2/2 valores plausibles
+      Bat1 voltage 0x112C = 53.90      plausible
+      Bat1 SOC     0x1138 = 46.00      plausible
+  Clasico: 0/2 valores plausibles
+      Battery V    0x1108 = 0.00       -
+      AC output V  0x1111 = 52.80      -
+  -> El mapa IVGM-8K parece el correcto para este equipo.
+  (Ninguno de los dos mapas esta validado: confirme SIEMPRE contra la pantalla.)
+

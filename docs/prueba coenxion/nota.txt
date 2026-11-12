@@ -1,0 +1,82 @@
+Para leer todos los datos de tus tres inversores Felicity en paralelo, la estrategia correcta es preguntar a cada uno por separado usando su propia dirección Modbus. El inversor maestro no actúa como un agregador que devuelva los datos de los esclavos; cada unidad es un servidor Modbus independiente en el mismo bus RS485.
+
+🔑 El principio: un slave_id único por inversor
+El protocolo Modbus es de tipo maestro-esclavo puro. Tu aplicación (el maestro Modbus) pregunta a una dirección concreta, y solo el dispositivo con esa dirección responde con sus propios datos. La integración de referencia ha_felicity lo confirma al soportar explícitamente "Multiple hubs supported, ability to add multiple inverters". En la comunidad, el desarrollador de esa integración aclara que, si hay más de un dispositivo en el mismo bus, "You do need different slave_ids" (necesitas diferentes slave_id). Además, para instalaciones en paralelo, la guía de SolarAssistant indica que "you will need to connect each inverter with its own cable" (necesitarás conectar cada inversor con su propio cable), lo que refuerza la idea de que cada uno es un nodo direccionable individual.
+
+Tu problema actual es que el inversor físico #2, aunque está configurado como "paralelo 2", sigue teniendo su dirección Modbus en 1 (el valor por defecto de fábrica). Por eso responde a slave 1 y no a slave 2. La solución es cambiar el registro 0x2142 (Modbus ID) en cada inversor para que coincida con su rol de paralelo, y luego leer cada slave_id de forma secuencial.
+
+🗺️ Mapa de registros consolidado (IVGM 8K)
+Basado en tus volcados anteriores (paso1.txt, paso2.txt y el CSV), este es el mapa de los registros principales que tu aplicación debe leer de cada inversor. Los registros nuevos confirmados en el barrido completo están marcados con 🆕.
+
+Telemetría en tiempo real (bloque principal: 0x1118 – 0x1151)
+Dirección	Nombre	Escala	Signo	Unidad	Estado
+0x1118	PV1 Voltage	0.1	—	V	✅ Confirmado
+0x1119	PV2 Voltage	0.1	—	V	✅ Confirmado
+0x111C	PV1 Current	0.1	Sí	A	✅ Confirmado
+0x111D	PV2 Current	0.1	Sí	A	✅ Confirmado
+0x1128	PV1 Power	1	Sí	W	✅ Confirmado
+0x1129	PV2 Power	1	Sí	W	✅ Confirmado
+0x112C	Bat1 Voltage	0.1	—	V	✅ Confirmado
+0x1130	Bat1 Current	0.1	Sí	A	✅ Confirmado
+0x1131	Bat1 Power	1	Sí	W	✅ Confirmado
+0x1138	Bat1 SOC	0.1	—	%	✅ Confirmado
+0x113E	Output Frequency	0.01	—	Hz	🆕 (ej. 4876 → 48.76 Hz)
+0x113F	AC Output Voltage Phase A	0.1	—	V	🆕 (ej. 2446 → 244.6 V)
+0x1140	AC Output Voltage Phase B	0.1	—	V	🆕 (ej. 2429 → 242.9 V)
+0x1144	Temperatura 1	1	—	°C	🆕
+0x1145	Temperatura 2	1	—	°C	🆕
+0x1146	Temperatura 3	1	—	°C	🆕
+0x1150	Temperatura 4	1	—	°C	🆕
+0x1151	Temperatura 5	1	—	°C	🆕
+Nota: Los registros 0x1101–0x1104 cambian entre lecturas y no son enums de estado fiables. Para el modo de operación, usa 0x1100 (Work Mode), que en tu caso se mantiene estable.
+
+Configuración e identificación
+Dirección	Nombre	Valor en tu sistema	Interpretación
+0x2140	Parallel Count	3	Número de inversores en paralelo
+0x2141	Parallel Address	1 / 2 / 3	Rol: 1=Master, 2/3=Slave
+0x2142	Modbus ID	1 (por defecto)	Dirección del servidor Modbus
+0x2143	Rated Power	8000	Potencia nominal (8 kW)
+0xF801	Firmware Version	1039	Informativo
+Importante: Los registros que devuelven 0xFFFE (-2) en los barridos (p. ej., 0x230C–0x2347) no son fallos. El firmware los usa para marcar "parámetro no configurado / no disponible". Tu app debe mostrarlos como "N/A" o simplemente ignorarlos.
+
+💻 Implementación de la lectura en paralelo (pseudocódigo)
+La lógica es un bucle simple sobre los IDs de tus inversores. Aquí tienes la estructura en pseudocódigo (fácilmente adaptable a Java o Python):
+
+text
+// 1. Configuración: IDs Modbus únicos (deben coincidir con el rol de paralelo)
+int[] modbusIds = {1, 2, 3};
+
+// 2. Bucle de polling
+for (int id : modbusIds) {
+    // 3. Leer el bloque de telemetría completo con UNA sola petición
+    //    Dirección inicial: 0x1118 (PV1 Voltage)
+    //    Cantidad: 0x1151 - 0x1118 + 1 = 58 registros
+    ModbusResponse response = readHoldingRegisters(id, 0x1118, 58);
+
+    if (response.isOk()) {
+        // 4. Decodificar los 58 registros en un objeto de datos del inversor
+        InverterData data = decodeRegisters(response.getRegisters());
+        data.inverterId = id; // Etiquetar con el ID correcto
+
+        // 5. Publicar en el dashboard / MQTT / base de datos
+        updateDashboard(data);
+    } else {
+        // 6. Si un inversor no responde, registrarlo pero continuar con los demás
+        logWarning("Inversor con Modbus ID " + id + " no responde.");
+    }
+}
+¿Por qué una sola petición de 58 registros? Para minimizar el tráfico en el bus RS485. Leer cada registro individualmente sería extremadamente lento y propenso a errores. La función Modbus FC03 (Read Holding Registers) permite leer un bloque contiguo de hasta 125 registros en una sola transacción.
+
+⚠️ Consideraciones críticas antes de implementar
+Configura primero los IDs. Antes de que este código funcione, debes asegurarte de que cada inversor tenga su 0x2142 igual a su 0x2141. Si no, todos responderán a slave 1 y tu bucle fallará para los IDs 2 y 3. Puedes usar el script verificar_ids_paralelo.py de la conversación anterior para confirmar el estado, y vtodo.py --write 0x2142 <valor> (conectándote físicamente a cada inversor) para corregirlo.
+
+Manejo del "ruido" del touchscreen. Como viste en tu primera lectura, el HMI del inversor a veces emite texto (Scan:x[0]:180...) que contamina el bus. Tu función de lectura debe incluir un mecanismo de reintento con un drain() previo del socket TCP para descartar bytes residuales.
+
+Valores 0xFFFE. No los trates como datos. En la lógica de decodificación, si un registro es 0xFFFE, asígnale el valor null o "N/A" en tu modelo de datos.
+
+Timeout y reintentos. Usa un timeout corto (p. ej., 1-2 segundos) por inversor. Si un inversor no responde en 2 segundos, pasa al siguiente. No dejes que un solo inversor bloqueado detenga la lectura de los demás.
+
+Frecuencia de polling. Para un dashboard en tiempo real, un intervalo de 5 segundos entre ciclos completos (los 3 inversores) es adecuado y no sobrecarga el bus.
+
+💎 Resumen
+La idea de "preguntar al maestro" no es viable con Modbus. La solución robusta y estándar es: configurar una dirección Modbus única en cada inversor (1, 2, 3) y hacer que tu app itere sobre ellas, leyendo el bloque de telemetría 0x1118–0x1151 de cada una en una sola petición. El mapa de registros consolidado de arriba te da todos los campos confirmados para construir el dashboard de cada unidad.
