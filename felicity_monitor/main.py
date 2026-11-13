@@ -84,58 +84,6 @@ QHeaderView::section { background: #16213e; color: #e0e0e0; padding: 5px; border
 # VALIDACIÓN DE PARÁMETROS DE ESCRITURA
 # ══════════════════════════════════════════════════════════════════════════════
 
-class WriteValidator:
-    """Validador completo para los 9 parámetros de escritura del inversor."""
-
-    RANGES_48V = {
-        'cutoff':       (40.0, 48.0, 44.0),
-        'absorb':       (55.0, 58.4, 56.8),
-        'float':        (52.0, 54.4, 54.0),
-        'recharge':     (44.0, 51.0, 48.0),
-        'back_to_bat':  (44.0, 51.0, 46.0),
-    }
-
-    RANGES_CURRENT = {
-        'max_charge':   (0, 100, 60),
-        'max_ac_charge': (0, 30, 30),
-    }
-
-    @classmethod
-    def validate_voltage(cls, param: str, value: float) -> tuple[bool, str]:
-        if param not in cls.RANGES_48V:
-            return False, f"Parámetro desconocido: {param}"
-        min_v, max_v, default = cls.RANGES_48V[param]
-        if not (min_v <= value <= max_v):
-            return False, f"{param.upper()} = {value}V fuera de rango [{min_v} - {max_v}V]"
-        return True, "OK"
-
-    @classmethod
-    def validate_current(cls, param: str, value: int) -> tuple[bool, str]:
-        if param not in cls.RANGES_CURRENT:
-            return False, f"Parámetro desconocido: {param}"
-        min_v, max_v, default = cls.RANGES_CURRENT[param]
-        if not (min_v <= value <= max_v):
-            return False, f"{param.upper()} = {value}A fuera de rango [{min_v} - {max_v}A]"
-        return True, "OK"
-
-    @classmethod
-    def validate_coherence(cls, cutoff: float, absorb: float, float_v: float,
-                           recharge: float, back_to_bat: float) -> list[str]:
-        errors = []
-        if absorb <= float_v:
-            errors.append(f"Absorción ({absorb}V) debe ser > Flotación ({float_v}V)")
-        if float_v <= recharge:
-            errors.append(f"Flotación ({float_v}V) debe ser > Recarga ({recharge}V)")
-        if recharge <= cutoff:
-            errors.append(f"Recarga ({recharge}V) debe ser > Corte ({cutoff}V)")
-        if back_to_bat <= cutoff:
-            errors.append(f"Regreso a batería ({back_to_bat}V) debe ser > Corte ({cutoff}V)")
-        return errors
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# WIDGET: TARJETA MÉTRICA
-# ══════════════════════════════════════════════════════════════════════════════
 
 class MetricCard(QFrame):
     def __init__(self, title: str, unit: str = '', warn_high: float = None, parent=None):
@@ -189,11 +137,12 @@ class TabConnection(QWidget):
     disconnect_requested = pyqtSignal()
     autodetect_requested = pyqtSignal(str)
     multi_config_changed = pyqtSignal(bool)  # enabled True/False
-    # Configuración de paralelo del IVGM-8K:
+    # Diagnóstico de paralelo del IVGM-8K (SOLO LECTURAS):
     #   parallel_config_requested  → (tipo_conexion, params)
-    #   parallel_id_assign_requested → (tipo_conexion, params, nuevo_id)
     parallel_config_requested = pyqtSignal(str, dict)
-    parallel_id_assign_requested = pyqtSignal(str, dict, int)
+    # Escaneo del bus RS485 para detectar slave IDs (SOLO LECTURAS)
+    scan_slave_ids_requested = pyqtSignal(str, dict)
+
 
     def __init__(self, profile_manager=None):
         super().__init__()
@@ -222,7 +171,8 @@ class TabConnection(QWidget):
             "• Dirección esclavo: configurable (1-247, por defecto 1)\n"
             "• Mapa clásico: estado 0x1100-0x112A, config 0x211F-0x2159\n"
             "• Mapa IVGM-8K: estado 0x1100-0x1177 (Series RS485)\n"
-            "• Funciones: Read Holding (0x03), Write Single (0x06)\n"
+            "• Funciones: Read Holding (0x03) — SOLO LECTURAS\n"
+                "• Modo: SOLO LECTURA. La app nunca escribe en el inversor.\n"
                 "• Framing TCP: RTU tunnelled (por defecto), Auto o Modbus TCP (MBAP)"
         )
         lbl_info.setStyleSheet("color:#888; font-size:11px; font-family: 'Courier New';")
@@ -378,10 +328,23 @@ class TabConnection(QWidget):
         self.btn_add_inv.clicked.connect(self._add_inverter_row)
         self.btn_del_inv = QPushButton("- Quitar seleccionado")
         self.btn_del_inv.clicked.connect(self._remove_inverter_row)
+        self.btn_scan_inv = QPushButton("Detectar en el bus")
+        self.btn_scan_inv.setToolTip(
+            "Escanea el bus RS485 y detecta qué direcciones Modbus responden.\n"
+            "Es una lectura: no escribe nada en ningún inversor.\n"
+            "La app luego consulta cada ID por separado, cambiando el "
+            "slave_id de cada petición."
+        )
+        self.btn_scan_inv.clicked.connect(self._on_scan_slave_ids)
         row_inv_btns.addWidget(self.btn_add_inv)
         row_inv_btns.addWidget(self.btn_del_inv)
+        row_inv_btns.addWidget(self.btn_scan_inv)
         row_inv_btns.addStretch()
         gm.addLayout(row_inv_btns)
+
+        self.lbl_scan_result = QLabel("")
+        self.lbl_scan_result.setStyleSheet("color:#888; font-size:10px;")
+        gm.addWidget(self.lbl_scan_result)
 
         gm.addWidget(QLabel("Timeout por ID (ms):"))
         self.sp_multi_timeout = QSpinBox()
@@ -417,7 +380,9 @@ class TabConnection(QWidget):
         # Modbus propio (registro 0x2142). De fábrica todos vienen en 1,
         # así que hay que asignarles 1, 2, 3 conectándose a cada uno por
         # separado (cable directo al que se quiere configurar).
-        self.grp_parallel = QGroupBox("Configuración de paralelo (IVGM-8K)")
+        self.grp_parallel = QGroupBox(
+            "Diagnóstico de paralelo (IVGM-8K) — SOLO LECTURA"
+        )
         gp = QGridLayout(self.grp_parallel)
 
         self.btn_read_parallel = QPushButton("Leer configuración")
@@ -439,28 +404,9 @@ class TabConnection(QWidget):
             gp.addWidget(lbl, 0, col)
             gp.addWidget(widget, 1, col)
 
-        gp.addWidget(QLabel("Asignar Modbus ID:"), 2, 0)
-        self.sp_par_modbus = QSpinBox()
-        self.sp_par_modbus.setRange(1, 247)
-        self.sp_par_modbus.setValue(1)
-        self.sp_par_modbus.setToolTip(
-            "Nuevo ID Modbus para el inversor conectado (1-247).\n"
-            "Conectate a cada inversor por separado y asignale su ID:\n"
-            "maestro = 1, esclavo 2 = 2, esclavo 3 = 3."
-        )
-        gp.addWidget(self.sp_par_modbus, 2, 1)
-
-        self.btn_set_parallel = QPushButton("Asignar ID")
-        self.btn_set_parallel.clicked.connect(self._on_set_parallel)
-        self.btn_set_parallel.setToolTip(
-            "Escribe el ID en el registro 0x2142 del inversor conectado.\n"
-            "⚠ Escribí en el inversor correcto: es un ajuste de fábrica."
-        )
-        gp.addWidget(self.btn_set_parallel, 2, 2)
-
         self.lbl_par_note = QLabel(
-            "⚠ Conectá un inversor por vez (cable directo) para asignarle su ID.\n"
-            "El ID debe coincidir con su rol: 1=maestro, 2 y 3=esclavos."
+            "🔒 Solo lectura: esta app nunca escribe en el inversor.\n"
+            "El ID Modbus de cada equipo se configura en su propio display."
         )
         self.lbl_par_note.setStyleSheet("color:#f39c12; font-size:10px;")
         gp.addWidget(self.lbl_par_note, 3, 0, 1, 4)
@@ -698,15 +644,52 @@ class TabConnection(QWidget):
             config = self._get_tcp_config()
         self.parallel_config_requested.emit(conn_type, config)
 
-    def _on_set_parallel(self):
-        """Pide asignar un nuevo Modbus ID (0x2142) al inversor conectado."""
-        new_id = self.sp_par_modbus.value()
+    def _on_scan_slave_ids(self):
+        """
+        Pide escanear el bus RS485 para detectar qué direcciones Modbus
+        responden. Solo lecturas: no escribe en ningún inversor.
+        """
         conn_type = self.get_connection_type()
         if conn_type == "serial":
             config = self._get_serial_config()
         else:
             config = self._get_tcp_config()
-        self.parallel_id_assign_requested.emit(conn_type, config, new_id)
+        self.btn_scan_inv.setEnabled(False)
+        self.btn_scan_inv.setText("Detectando...")
+        self.lbl_scan_result.setText("Escaneando el bus (solo lecturas)...")
+        QApplication.processEvents()
+        self.scan_slave_ids_requested.emit(conn_type, config)
+
+    def set_scan_result(self, ids, error: str = ""):
+        """Muestra el resultado del escaneo y llena la tabla de inversores."""
+        self.btn_scan_inv.setEnabled(True)
+        self.btn_scan_inv.setText("Detectar en el bus")
+        if error:
+            self.lbl_scan_result.setText(f"✖ {error}")
+            self.lbl_scan_result.setStyleSheet("color:#e94560; font-size:10px;")
+            return
+        if not ids:
+            self.lbl_scan_result.setText(
+                "No respondió ningún ID (1-16). Revisá el cableado RS485, "
+                "la alimentación y que el gateway esté en modo transparente."
+            )
+            self.lbl_scan_result.setStyleSheet("color:#f39c12; font-size:10px;")
+            return
+
+        self.lbl_scan_result.setText(
+            f"✓ {len(ids)} inversor(es) detectado(s): "
+            + ", ".join(f"ID {i}" for i in ids)
+        )
+        self.lbl_scan_result.setStyleSheet("color:#27ae60; font-size:10px;")
+
+        # Reconstruir la tabla con los IDs detectados.
+        mapa = "ivgm_8k" if self._profile_index_for_map("ivgm_8k") else "classic"
+        self.tbl_inverters.setRowCount(0)
+        for sid in ids:
+            etiqueta = "Maestro" if sid == 1 else f"Esclavo {sid - 1}"
+            self._add_inverter_row(sid, etiqueta, mapa)
+        self.multi_config_changed.emit(self.chk_multi_enabled.isChecked())
+
 
     def show_parallel_config(self, count, address, modbus_id, rated_power):
         """Muestra la configuración de paralelo leída del equipo."""
@@ -1654,477 +1637,6 @@ class TabSettings(QWidget):
 # TAB 4 — CONTROL MODBUS (ESCRITURA) — LOS 9 PARÁMETROS
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TabControl(QWidget):
-    def __init__(self):
-        super().__init__()
-        self._conn: ModbusConnection = None
-        self._current_settings = None
-        self._build_ui()
-
-    def _build_ui(self):
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setSpacing(10)
-        layout.setContentsMargins(10, 10, 10, 10)
-
-        self.lbl_status = QLabel("Sin conexión — Conecta el inversor primero")
-        self.lbl_status.setAlignment(Qt.AlignCenter)
-        self.lbl_status.setStyleSheet(
-            "background:#2a1a0a; color:#f39c12; font-size:13px; padding:10px; border-radius:8px;"
-        )
-        layout.addWidget(self.lbl_status)
-
-        grp_warn = QGroupBox("⚠️ Importante — Escritura en EEPROM")
-        gw = QVBoxLayout(grp_warn)
-        lbl_warn = QLabel(
-            "• Los valores se guardan PERMANENTEMENTE en el inversor\n"
-            "• Máximo 1 cambio al día (recomendado)\n"
-            "• Los valores deben ser coherentes: Absorción > Flotación > Recarga > Corte"
-        )
-        lbl_warn.setStyleSheet("color:#f39c12; font-size:11px;")
-        gw.addWidget(lbl_warn)
-        layout.addWidget(grp_warn)
-
-        grp_v = QGroupBox("📋 VOLTAJES DE BATERÍA (5 parámetros)")
-        grid = QGridLayout(grp_v)
-        self.lbl_results = {}
-
-        # Cutoff
-        self.sp_cutoff = QDoubleSpinBox()
-        self.sp_cutoff.setRange(40.0, 48.0)
-        self.sp_cutoff.setSuffix(" V")
-        self.sp_cutoff.setDecimals(1)
-        self.sp_cutoff.setValue(44.0)
-        self.sp_cutoff.setMinimumWidth(100)
-        btn_cutoff = QPushButton("Aplicar Corte (0x211F)")
-        btn_cutoff.setObjectName("btn_write")
-        btn_cutoff.clicked.connect(lambda: self._write("cutoff", self.sp_cutoff.value()))
-        lbl_cutoff_range = QLabel("Rango: 40-48V")
-        lbl_cutoff_range.setStyleSheet("color:#555; font-size:10px;")
-        self.lbl_results['cutoff'] = QLabel("")
-        self.lbl_results['cutoff'].setStyleSheet("font-size:11px;")
-        grid.addWidget(QLabel("Corte (0x211F):"), 0, 0)
-        grid.addWidget(self.sp_cutoff, 0, 1)
-        grid.addWidget(btn_cutoff, 0, 2)
-        grid.addWidget(lbl_cutoff_range, 0, 3)
-        grid.addWidget(self.lbl_results['cutoff'], 0, 4)
-
-        # Absorb
-        self.sp_absorb = QDoubleSpinBox()
-        self.sp_absorb.setRange(55.0, 58.4)
-        self.sp_absorb.setSuffix(" V")
-        self.sp_absorb.setDecimals(1)
-        self.sp_absorb.setValue(56.8)
-        self.sp_absorb.setMinimumWidth(100)
-        btn_absorb = QPushButton("Aplicar Absorción (0x2122)")
-        btn_absorb.setObjectName("btn_write")
-        btn_absorb.clicked.connect(lambda: self._write("absorb", self.sp_absorb.value()))
-        lbl_absorb_range = QLabel("Rango: 55-58.4V")
-        lbl_absorb_range.setStyleSheet("color:#555; font-size:10px;")
-        self.lbl_results['absorb'] = QLabel("")
-        self.lbl_results['absorb'].setStyleSheet("font-size:11px;")
-        grid.addWidget(QLabel("Absorción (0x2122):"), 1, 0)
-        grid.addWidget(self.sp_absorb, 1, 1)
-        grid.addWidget(btn_absorb, 1, 2)
-        grid.addWidget(lbl_absorb_range, 1, 3)
-        grid.addWidget(self.lbl_results['absorb'], 1, 4)
-
-        # Float
-        self.sp_float = QDoubleSpinBox()
-        self.sp_float.setRange(52.0, 54.4)
-        self.sp_float.setSuffix(" V")
-        self.sp_float.setDecimals(1)
-        self.sp_float.setValue(54.0)
-        self.sp_float.setMinimumWidth(100)
-        btn_float = QPushButton("Aplicar Flotación (0x2123)")
-        btn_float.setObjectName("btn_write")
-        btn_float.clicked.connect(lambda: self._write("float", self.sp_float.value()))
-        lbl_float_range = QLabel("Rango: 52-54.4V")
-        lbl_float_range.setStyleSheet("color:#555; font-size:10px;")
-        self.lbl_results['float'] = QLabel("")
-        self.lbl_results['float'].setStyleSheet("font-size:11px;")
-        grid.addWidget(QLabel("Flotación (0x2123):"), 2, 0)
-        grid.addWidget(self.sp_float, 2, 1)
-        grid.addWidget(btn_float, 2, 2)
-        grid.addWidget(lbl_float_range, 2, 3)
-        grid.addWidget(self.lbl_results['float'], 2, 4)
-
-        # Recharge
-        self.sp_recharge = QDoubleSpinBox()
-        self.sp_recharge.setRange(44.0, 51.0)
-        self.sp_recharge.setSuffix(" V")
-        self.sp_recharge.setDecimals(1)
-        self.sp_recharge.setValue(48.0)
-        self.sp_recharge.setMinimumWidth(100)
-        btn_recharge = QPushButton("Aplicar Recarga (0x2156)")
-        btn_recharge.setObjectName("btn_write")
-        btn_recharge.clicked.connect(lambda: self._write("recharge", self.sp_recharge.value()))
-        lbl_recharge_range = QLabel("Rango: 44-51V")
-        lbl_recharge_range.setStyleSheet("color:#555; font-size:10px;")
-        self.lbl_results['recharge'] = QLabel("")
-        self.lbl_results['recharge'].setStyleSheet("font-size:11px;")
-        grid.addWidget(QLabel("Recarga (0x2156):"), 3, 0)
-        grid.addWidget(self.sp_recharge, 3, 1)
-        grid.addWidget(btn_recharge, 3, 2)
-        grid.addWidget(lbl_recharge_range, 3, 3)
-        grid.addWidget(self.lbl_results['recharge'], 3, 4)
-
-        # Back to battery
-        self.sp_back_to_bat = QDoubleSpinBox()
-        self.sp_back_to_bat.setRange(44.0, 51.0)
-        self.sp_back_to_bat.setSuffix(" V")
-        self.sp_back_to_bat.setDecimals(1)
-        self.sp_back_to_bat.setValue(46.0)
-        self.sp_back_to_bat.setMinimumWidth(100)
-        btn_back_to_bat = QPushButton("Aplicar Regreso Bat (0x2159)")
-        btn_back_to_bat.setObjectName("btn_write")
-        btn_back_to_bat.clicked.connect(lambda: self._write("back_to_bat", self.sp_back_to_bat.value()))
-        lbl_back_range = QLabel("Rango: 44-51V")
-        lbl_back_range.setStyleSheet("color:#555; font-size:10px;")
-        self.lbl_results['back_to_bat'] = QLabel("")
-        self.lbl_results['back_to_bat'].setStyleSheet("font-size:11px;")
-        grid.addWidget(QLabel("Regreso Bat (0x2159):"), 4, 0)
-        grid.addWidget(self.sp_back_to_bat, 4, 1)
-        grid.addWidget(btn_back_to_bat, 4, 2)
-        grid.addWidget(lbl_back_range, 4, 3)
-        grid.addWidget(self.lbl_results['back_to_bat'], 4, 4)
-
-        layout.addWidget(grp_v)
-
-        grp_p = QGroupBox("⚡ PRIORIDADES (2 parámetros)")
-        gp = QVBoxLayout(grp_p)
-
-        row_prio = QHBoxLayout()
-        row_prio.addWidget(QLabel("Prioridad salida (0x212A):"))
-        self.cb_out_prio = QComboBox()
-        self.cb_out_prio.addItem("0 = Red primero", 0)
-        self.cb_out_prio.addItem("1 = Solar primero", 1)
-        self.cb_out_prio.addItem("2 = SBU (Solar→Bat→Red)", 2)
-        row_prio.addWidget(self.cb_out_prio)
-        btn_out_prio = QPushButton("Aplicar")
-        btn_out_prio.setObjectName("btn_write")
-        btn_out_prio.clicked.connect(self._write_output_priority)
-        row_prio.addWidget(btn_out_prio)
-        self.lbl_results['out_prio'] = QLabel("")
-        self.lbl_results['out_prio'].setStyleSheet("font-size:11px;")
-        row_prio.addWidget(self.lbl_results['out_prio'])
-        row_prio.addStretch()
-        gp.addLayout(row_prio)
-
-        row_charge = QHBoxLayout()
-        row_charge.addWidget(QLabel("Prioridad carga (0x212C):"))
-        self.cb_charge_prio = QComboBox()
-        self.cb_charge_prio.addItem("0 = Solo red", 0)
-        self.cb_charge_prio.addItem("1 = Solar primero", 1)
-        self.cb_charge_prio.addItem("2 = Solar + Red", 2)
-        self.cb_charge_prio.addItem("3 = Solo solar", 3)
-        row_charge.addWidget(self.cb_charge_prio)
-        btn_charge_prio = QPushButton("Aplicar")
-        btn_charge_prio.setObjectName("btn_write")
-        btn_charge_prio.clicked.connect(self._write_charge_priority)
-        row_charge.addWidget(btn_charge_prio)
-        self.lbl_results['charge_prio'] = QLabel("")
-        self.lbl_results['charge_prio'].setStyleSheet("font-size:11px;")
-        row_charge.addWidget(self.lbl_results['charge_prio'])
-        row_charge.addStretch()
-        gp.addLayout(row_charge)
-
-        layout.addWidget(grp_p)
-
-        grp_c = QGroupBox("🔌 CORRIENTES (2 parámetros)")
-        gc = QVBoxLayout(grp_c)
-
-        row_max_charge = QHBoxLayout()
-        row_max_charge.addWidget(QLabel("Corriente máx carga (0x212E):"))
-        self.sp_max_charge = QSpinBox()
-        self.sp_max_charge.setRange(0, 100)
-        self.sp_max_charge.setSuffix(" A")
-        self.sp_max_charge.setValue(60)
-        self.sp_max_charge.setMinimumWidth(100)
-        row_max_charge.addWidget(self.sp_max_charge)
-        lbl_max_range = QLabel("Rango: 0-100A")
-        lbl_max_range.setStyleSheet("color:#555; font-size:10px;")
-        row_max_charge.addWidget(lbl_max_range)
-        btn_max_charge = QPushButton("Aplicar")
-        btn_max_charge.setObjectName("btn_write")
-        btn_max_charge.clicked.connect(self._write_max_charge)
-        row_max_charge.addWidget(btn_max_charge)
-        self.lbl_results['max_charge'] = QLabel("")
-        self.lbl_results['max_charge'].setStyleSheet("font-size:11px;")
-        row_max_charge.addWidget(self.lbl_results['max_charge'])
-        row_max_charge.addStretch()
-        gc.addLayout(row_max_charge)
-
-        row_max_ac = QHBoxLayout()
-        row_max_ac.addWidget(QLabel("Corriente máx carga AC (0x2130):"))
-        self.sp_max_ac = QSpinBox()
-        self.sp_max_ac.setRange(0, 30)
-        self.sp_max_ac.setSuffix(" A")
-        self.sp_max_ac.setValue(30)
-        self.sp_max_ac.setMinimumWidth(100)
-        row_max_ac.addWidget(self.sp_max_ac)
-        lbl_max_ac_range = QLabel("Rango: 0-30A")
-        lbl_max_ac_range.setStyleSheet("color:#555; font-size:10px;")
-        row_max_ac.addWidget(lbl_max_ac_range)
-        btn_max_ac = QPushButton("Aplicar")
-        btn_max_ac.setObjectName("btn_write")
-        btn_max_ac.clicked.connect(self._write_max_ac)
-        row_max_ac.addWidget(btn_max_ac)
-        self.lbl_results['max_ac'] = QLabel("")
-        self.lbl_results['max_ac'].setStyleSheet("font-size:11px;")
-        row_max_ac.addWidget(self.lbl_results['max_ac'])
-        row_max_ac.addStretch()
-        gc.addLayout(row_max_ac)
-
-        layout.addWidget(grp_c)
-
-        grp_log = QGroupBox("📝 Log de escritura")
-        gl = QVBoxLayout(grp_log)
-        self.txt_log = QTextEdit()
-        self.txt_log.setReadOnly(True)
-        self.txt_log.setMinimumHeight(100)
-        gl.addWidget(self.txt_log)
-        layout.addWidget(grp_log)
-
-        layout.addStretch()
-        scroll.setWidget(container)
-        outer.addWidget(scroll)
-
-    def set_connection(self, conn: ModbusConnection):
-        self._conn = conn
-        if conn and conn.is_open:
-            self.lbl_status.setText("Conectado — Listo para escribir")
-            self.lbl_status.setStyleSheet(
-                "background:#0a2a1a; color:#27ae60; font-size:13px; padding:10px; border-radius:8px;"
-            )
-        else:
-            self.lbl_status.setText("Sin conexión — Conecta el inversor primero")
-            self.lbl_status.setStyleSheet(
-                "background:#2a1a0a; color:#f39c12; font-size:13px; padding:10px; border-radius:8px;"
-            )
-
-    def update_from_settings(self, settings: ModbusSettings):
-        self._current_settings = settings
-
-        self.sp_absorb.setValue(settings.battery_cv_voltage)
-        self.sp_float.setValue(settings.battery_float_voltage)
-        self.sp_cutoff.setValue(settings.battery_cutoff_voltage)
-        self.sp_recharge.setValue(settings.battery_back_to_grid_voltage)
-        self.sp_back_to_bat.setValue(settings.battery_back_to_battery_voltage)
-        self.sp_max_charge.setValue(settings.max_charge_current)
-        self.sp_max_ac.setValue(settings.max_ac_charge_current)
-
-        for i in range(self.cb_out_prio.count()):
-            if self.cb_out_prio.itemData(i) == settings.output_priority.value:
-                self.cb_out_prio.setCurrentIndex(i)
-                break
-
-        for i in range(self.cb_charge_prio.count()):
-            if self.cb_charge_prio.itemData(i) == settings.charge_priority.value:
-                self.cb_charge_prio.setCurrentIndex(i)
-                break
-
-    def _write(self, param: str, value: float):
-        if not self._conn or not self._conn.is_open:
-            self._log(f"Error: No hay conexión", '#e74c3c')
-            return
-
-        valid, msg = WriteValidator.validate_voltage(param, value)
-        if not valid:
-            self._show_result(param, False, msg)
-            self._log(f"✗ Validación falló: {msg}", '#e74c3c')
-            return
-
-        cutoff = self.sp_cutoff.value()
-        absorb = self.sp_absorb.value()
-        float_v = self.sp_float.value()
-        recharge = self.sp_recharge.value()
-        back_to_bat = self.sp_back_to_bat.value()
-
-        if param == 'cutoff':
-            cutoff = value
-        elif param == 'absorb':
-            absorb = value
-        elif param == 'float':
-            float_v = value
-        elif param == 'recharge':
-            recharge = value
-        elif param == 'back_to_bat':
-            back_to_bat = value
-
-        errors = WriteValidator.validate_coherence(cutoff, absorb, float_v, recharge, back_to_bat)
-        if errors:
-            self._log(f"⚠️ Coherencia: {'; '.join(errors)}", '#f39c12')
-
-        param_labels = {
-            'cutoff': 'voltaje de CORTE',
-            'absorb': 'voltaje de ABSORCIÓN',
-            'float': 'voltaje de FLOTACIÓN',
-            'recharge': 'voltaje de RECARGA',
-            'back_to_bat': 'voltaje de REGRESO A BATERÍA'
-        }
-
-        reply = QMessageBox.question(
-            self, "Confirmar escritura",
-            f"¿Escribir {param_labels.get(param, param)} = {value}V?\n\n"
-            f"⚠️ Este valor se guarda PERMANENTEMENTE en la EEPROM del inversor.",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if reply == QMessageBox.No:
-            return
-
-        methods = {
-            'cutoff': self._conn.set_cutoff_voltage,
-            'absorb': self._conn.set_absorb_voltage,
-            'float': self._conn.set_float_voltage,
-            'recharge': self._conn.set_recharge_voltage,
-            'back_to_bat': self._conn.set_back_to_battery_voltage,
-        }
-
-        result = methods[param](value)
-
-        if result.success:
-            self._show_result(param, True, f"✓ {value}V → ACK ({result.latency_ms:.0f}ms)")
-            self._log(f"✓ {param_labels.get(param, param).upper()} = {value}V → ACK ({result.latency_ms:.0f}ms)", '#27ae60')
-        else:
-            self._show_result(param, False, f"✗ {result.error_message}")
-            self._log(f"✗ Error {param_labels.get(param, param)}: {result.error_message}", '#e74c3c')
-
-    def _write_output_priority(self):
-        if not self._conn or not self._conn.is_open:
-            return
-        priority = self.cb_out_prio.currentData()
-        priority_names = {0: "Red primero", 1: "Solar primero", 2: "SBU"}
-
-        reply = QMessageBox.question(
-            self, "Confirmar",
-            f"¿Cambiar prioridad de salida a: {priority_names.get(priority, priority)}?",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if reply == QMessageBox.No:
-            return
-
-        result = self._conn.set_output_priority(OutputPriority(priority))
-        if result.success:
-            self.lbl_results['out_prio'].setText(f"✓ {priority_names.get(priority)}")
-            self.lbl_results['out_prio'].setStyleSheet("color:#27ae60; font-size:11px;")
-            self._log(f"✓ Prioridad salida = {priority_names.get(priority)} → ACK", '#27ae60')
-        else:
-            self.lbl_results['out_prio'].setText(f"✗ Error")
-            self.lbl_results['out_prio'].setStyleSheet("color:#e74c3c; font-size:11px;")
-            self._log(f"✗ Error prioridad salida: {result.error_message}", '#e74c3c')
-
-    def _write_charge_priority(self):
-        if not self._conn or not self._conn.is_open:
-            return
-        priority = self.cb_charge_prio.currentData()
-        priority_names = {0: "Solo red", 1: "Solar primero", 2: "Solar + Red", 3: "Solo solar"}
-
-        reply = QMessageBox.question(
-            self, "Confirmar",
-            f"¿Cambiar prioridad de carga a: {priority_names.get(priority, priority)}?",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if reply == QMessageBox.No:
-            return
-
-        result = self._conn.set_charge_priority(ChargePriority(priority))
-        if result.success:
-            self.lbl_results['charge_prio'].setText(f"✓ {priority_names.get(priority)}")
-            self.lbl_results['charge_prio'].setStyleSheet("color:#27ae60; font-size:11px;")
-            self._log(f"✓ Prioridad carga = {priority_names.get(priority)} → ACK", '#27ae60')
-        else:
-            self.lbl_results['charge_prio'].setText(f"✗ Error")
-            self.lbl_results['charge_prio'].setStyleSheet("color:#e74c3c; font-size:11px;")
-            self._log(f"✗ Error prioridad carga: {result.error_message}", '#e74c3c')
-
-    def _write_max_charge(self):
-        if not self._conn or not self._conn.is_open:
-            return
-        value = self.sp_max_charge.value()
-
-        valid, msg = WriteValidator.validate_current('max_charge', value)
-        if not valid:
-            self.lbl_results['max_charge'].setText(f"✗ {msg}")
-            self.lbl_results['max_charge'].setStyleSheet("color:#e74c3c; font-size:11px;")
-            return
-
-        reply = QMessageBox.question(
-            self, "Confirmar",
-            f"¿Cambiar corriente máx de carga a {value}A?",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if reply == QMessageBox.No:
-            return
-
-        result = self._conn.set_max_charge_current(value)
-        if result.success:
-            self.lbl_results['max_charge'].setText(f"✓ {value}A → ACK")
-            self.lbl_results['max_charge'].setStyleSheet("color:#27ae60; font-size:11px;")
-            self._log(f"✓ Corriente máx carga = {value}A → ACK", '#27ae60')
-        else:
-            self.lbl_results['max_charge'].setText(f"✗ Error")
-            self.lbl_results['max_charge'].setStyleSheet("color:#e74c3c; font-size:11px;")
-            self._log(f"✗ Error corriente máx carga: {result.error_message}", '#e74c3c')
-
-    def _write_max_ac(self):
-        if not self._conn or not self._conn.is_open:
-            return
-        value = self.sp_max_ac.value()
-
-        valid, msg = WriteValidator.validate_current('max_ac_charge', value)
-        if not valid:
-            self.lbl_results['max_ac'].setText(f"✗ {msg}")
-            self.lbl_results['max_ac'].setStyleSheet("color:#e74c3c; font-size:11px;")
-            return
-
-        reply = QMessageBox.question(
-            self, "Confirmar",
-            f"¿Cambiar corriente máx de carga AC a {value}A?",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if reply == QMessageBox.No:
-            return
-
-        result = self._conn.set_max_ac_charge_current(value)
-        if result.success:
-            self.lbl_results['max_ac'].setText(f"✓ {value}A → ACK")
-            self.lbl_results['max_ac'].setStyleSheet("color:#27ae60; font-size:11px;")
-            self._log(f"✓ Corriente máx carga AC = {value}A → ACK", '#27ae60')
-        else:
-            self.lbl_results['max_ac'].setText(f"✗ Error")
-            self.lbl_results['max_ac'].setStyleSheet("color:#e74c3c; font-size:11px;")
-            self._log(f"✗ Error corriente máx carga AC: {result.error_message}", '#e74c3c')
-
-    def _show_result(self, param: str, success: bool, msg: str):
-        if param in self.lbl_results:
-            if success:
-                self.lbl_results[param].setText(f"✓ {msg}")
-                self.lbl_results[param].setStyleSheet("color:#27ae60; font-size:11px;")
-            else:
-                self.lbl_results[param].setText(f"✗ {msg}")
-                self.lbl_results[param].setStyleSheet("color:#e74c3c; font-size:11px;")
-
-    def _log(self, text: str, color: str = "#888"):
-        ts = datetime.now().strftime("%H:%M:%S")
-        self.txt_log.append(f'<span style="color:{color}">[{ts}] {text}</span>')
-        self.txt_log.verticalScrollBar().setValue(
-            self.txt_log.verticalScrollBar().maximum()
-        )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 5 — SCANNER DE REGISTROS MODBUS
-# ══════════════════════════════════════════════════════════════════════════════
 
 class TabScanner(QWidget):
     """Escáner de registros Modbus para descubrir parámetros ocultos."""
@@ -2720,7 +2232,6 @@ class MainWindow(QMainWindow):
         self.tab_monitor = TabMonitor()
         self.tab_parallel = TabParallelSystem()
         self.tab_settings = TabSettings()
-        self.tab_control = TabControl()
         self.tab_scanner = TabScanner()
         self.tab_profiles = TabProfiles(self._profile_manager)
         # Si se agregan/borran/editan perfiles, la tabla multi-inversor se actualiza
@@ -2732,7 +2243,6 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_monitor, "Monitor")
         self._tab_parallel_idx = self.tabs.addTab(self.tab_parallel, "⚡ Sistema en Paralelo")
         self.tabs.addTab(self.tab_settings, "Settings")
-        self.tabs.addTab(self.tab_control, "Control (9 params)")
         self.tabs.addTab(self.tab_scanner, "🔍 Scanner")
         self.tabs.addTab(self.tab_profiles, "Perfiles")
         self.tabs.addTab(self.tab_api, "API")
@@ -2747,7 +2257,7 @@ class MainWindow(QMainWindow):
         self.tab_parallel.navigate_to_inverter.connect(self._on_navigate_to_inverter)
         self.tab_conn.multi_config_changed.connect(self._on_multi_config_changed)
         self.tab_conn.parallel_config_requested.connect(self._on_read_parallel_config)
-        self.tab_conn.parallel_id_assign_requested.connect(self._on_assign_parallel_id)
+        self.tab_conn.scan_slave_ids_requested.connect(self._on_scan_slave_ids)
 
     def _build_status_bar(self):
         self.statusBar().showMessage("Listo · Protocolo: Modbus RTU · RS232 / TCP + Scanner")
@@ -2809,7 +2319,6 @@ class MainWindow(QMainWindow):
                 # Leer config multi-inversor
                 self._multi_config = self.tab_conn.get_multi_config()
                 self.tab_conn.log("Iniciando monitoreo en tiempo real...", '#3498db')
-                self.tab_control.set_connection(self._conn)
                 self.tab_scanner.set_connection(self._conn)
                 self._start_monitor()
                 self._read_settings()
@@ -2843,7 +2352,6 @@ class MainWindow(QMainWindow):
         self.tab_conn.btn_connect.setEnabled(True)
         self.tab_conn.btn_connect.setText("Conectar Modbus")
         self.tab_conn.log("Desconectado", '#f39c12')
-        self.tab_control.set_connection(None)
         self.tab_scanner.set_connection(None)
         self._show_parallel_tab(False)
         self.statusBar().showMessage("Desconectado · Modbus RTU")
@@ -2883,7 +2391,6 @@ class MainWindow(QMainWindow):
         )
         self._monitor.latency_update.connect(self.tab_monitor.update_latency)
         self._monitor.settings_received.connect(self.tab_settings.update_settings)
-        self._monitor.settings_received.connect(self.tab_control.update_from_settings)
         self._monitor.settings_received.connect(self.tab_monitor.update_settings_display)
         self._monitor.info_received.connect(self.tab_monitor.update_info)
         self._monitor.connection_lost.connect(self._on_connection_lost)
@@ -2920,7 +2427,6 @@ class MainWindow(QMainWindow):
         self.tab_conn.btn_connect.setEnabled(True)
         self.tab_conn.btn_connect.setText("Conectar Modbus")
         self.tab_conn.log("❌ Conexión perdida — demasiados errores consecutivos", '#e74c3c')
-        self.tab_control.set_connection(None)
         self.tab_scanner.set_connection(None)
         self.statusBar().showMessage("❌ Conexión perdida · Modbus RTU")
 
@@ -2934,7 +2440,6 @@ class MainWindow(QMainWindow):
         settings = self._conn.read_settings(map=map_name)
         if settings:
             self.tab_settings.update_settings(settings)
-            self.tab_control.update_from_settings(settings)
             self.tab_conn.log("Settings leídos correctamente", '#27ae60')
         else:
             self.tab_conn.log(
@@ -3052,6 +2557,38 @@ class MainWindow(QMainWindow):
             return None, False
         return conn, True
 
+    def _on_scan_slave_ids(self, conn_type: str, config: dict):
+        """
+        Escanea el bus RS485 y detecta qué direcciones Modbus responden.
+        Es una operación de SOLO LECTURAS: no escribe en ningún inversor.
+        """
+        from core.multi_inverter import scan_slave_ids
+
+        conn, temporary = self._open_temp_connection(conn_type, config)
+        if conn is None:
+            self.tab_conn.set_scan_result(
+                [], "No se pudo conectar al gateway para escanear el bus."
+            )
+            return
+        try:
+            self.tab_conn.log("🔍 Escaneando el bus RS485 (solo lecturas)...", '#3498db')
+            ids = scan_slave_ids(conn, timeout=0.8)
+            if ids:
+                self.tab_conn.log(
+                    f"✓ Inversores detectados en el bus: "
+                    f"{', '.join(f'ID {i}' for i in ids)}", '#27ae60'
+                )
+            else:
+                self.tab_conn.log(
+                    "⚠ No respondió ningún ID (1-16) en el bus", '#f39c12'
+                )
+            self.tab_conn.set_scan_result(ids)
+        except Exception as e:
+            self.tab_conn.set_scan_result([], f"Error: {e}")
+        finally:
+            if temporary and conn is not None:
+                conn.disconnect()
+
     def _on_read_parallel_config(self, conn_type: str, config: dict):
         """Lee la configuración de paralelo (0x2140-0x2143) del inversor."""
         conn, temporary = self._open_temp_connection(conn_type, config)
@@ -3094,62 +2631,6 @@ class MainWindow(QMainWindow):
             if temporary and conn is not None:
                 conn.disconnect()
 
-    def _on_assign_parallel_id(self, conn_type: str, config: dict, new_id: int):
-        """Escribe el nuevo Modbus ID (0x2142) en el inversor conectado."""
-        conn, temporary = self._open_temp_connection(conn_type, config)
-        if conn is None:
-            self.tab_conn.set_parallel_status(
-                "✖ No se pudo conectar para asignar el ID", '#e94560'
-            )
-            return
-        try:
-            mapa = self._parallel_map()
-            if not mapa.settings_fields:
-                self.tab_conn.set_parallel_status(
-                    "✖ El mapa seleccionado no define el bloque 0x2140-0x2143",
-                    '#e94560',
-                )
-                return
-            conn.set_map(mapa)
-
-            # Verificamos primero a qué ID responde el equipo ahora mismo.
-            actual = conn.read_settings(mapa)
-            id_actual = actual.modbus_id if actual else 0
-            if actual is None:
-                self.tab_conn.set_parallel_status(
-                    "✖ El inversor no respondió — revisá el cableado", '#e94560'
-                )
-                return
-            if id_actual == new_id:
-                self.tab_conn.set_parallel_status(
-                    f"• Ya tiene el ID {new_id}. No se escribe nada.", '#f39c12'
-                )
-                return
-
-            result = conn.write_single_register(0x2142, new_id)
-            if result.success:
-                self.tab_conn.show_parallel_config(
-                    actual.parallel_count, actual.parallel_address,
-                    new_id, actual.rated_power,
-                )
-                self.tab_conn.set_parallel_status(
-                    f"✓ Modbus ID cambiado de {id_actual} a {new_id}. "
-                    f"Ahora el equipo responde en el ID {new_id}.",
-                    '#27ae60',
-                )
-                self.tab_conn.log(
-                    f"✓ Modbus ID del inversor cambiado: {id_actual} → {new_id}",
-                    '#27ae60',
-                )
-            else:
-                self.tab_conn.set_parallel_status(
-                    f"✖ No se pudo escribir: {result.message}", '#e94560'
-                )
-        except Exception as e:
-            self.tab_conn.set_parallel_status(f"✖ Error: {e}", '#e94560')
-        finally:
-            if temporary and conn is not None:
-                conn.disconnect()
 
     def _show_parallel_tab(self, show: bool):
         """Muestra u oculta la pestaña 'Sistema en Paralelo'."""

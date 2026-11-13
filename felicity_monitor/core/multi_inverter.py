@@ -485,3 +485,73 @@ def _get_working_mode_value(status: ModbusStatus) -> int:
     except (ValueError, AttributeError):
         pass
     return -1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DETECCIÓN DE SLAVE IDs EN EL BUS RS485 (SOLO LECTURAS)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def scan_slave_ids(
+    conn,
+    slave_ids: Optional[List[int]] = None,
+    timeout: float = 0.8,
+    read_address: int = 0x1100,
+    read_count: int = 1,
+) -> List[int]:
+    """
+    Detecta qué direcciones Modbus responden en el bus RS485.
+
+    Es una operación de SOLO LECTURA: envía una FC03 a cada dirección
+    candidata y mira cuál responde con un CRC válido. No escribe nada
+    en ningún equipo.
+
+    En una instalación en paralelo cada inversor tiene su propia
+    dirección (configurada en el display del equipo). Esta función
+    permite que la app descubra cuáles hay conectadas sin que el
+    usuario tenga que escribirlas a mano.
+
+    Args:
+        conn: conexión ya abierta (ModbusTCPConnection o ModbusConnection)
+        slave_ids: candidatos a probar (por defecto 1..16)
+        timeout: segundos de espera por candidato
+        read_address: dirección de lectura a sondear
+        read_count: cantidad de registros a leer
+
+    Returns:
+        Lista de slave IDs que respondieron, en orden ascendente.
+    """
+    if conn is None:
+        return []
+
+    candidatos = list(slave_ids) if slave_ids else list(range(1, 17))
+    encontrados: List[int] = []
+
+    slave_original = conn.slave_id
+    timeout_original = getattr(conn, "timeout", None)
+
+    try:
+        for sid in candidatos:
+            if not (1 <= sid <= 247):
+                continue
+            conn.slave_id = sid
+            if timeout_original is not None:
+                try:
+                    conn.timeout = timeout
+                except (AttributeError, TypeError):
+                    pass
+            try:
+                regs = conn.read_holding_registers(read_address, read_count)
+            except Exception:
+                regs = None
+            if regs is not None and len(regs) >= read_count:
+                encontrados.append(sid)
+    finally:
+        # Restaurar siempre el estado original de la conexión.
+        conn.slave_id = slave_original
+        if timeout_original is not None:
+            try:
+                conn.timeout = timeout_original
+            except (AttributeError, TypeError):
+                pass
+
+    return encontrados
