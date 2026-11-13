@@ -41,7 +41,6 @@ from core.felicity_modbus import (
     calculate_crc,
     verify_crc,
     FUNCTION_READ_HOLDING,
-    FUNCTION_WRITE_SINGLE,
     READ_TIMEOUT_MS,
     MAX_RETRIES,
 )
@@ -71,7 +70,6 @@ class ModbusTCPConnection:
       - disconnect()
       - is_open -> bool
       - read_holding_registers(start, count) -> list|None
-      - write_single_register(address, value) -> WriteResult
       - read_status(map=None) -> ModbusStatus|None
       - read_settings(map=None) -> ModbusSettings|None
       - read_info(map=None) -> ModbusInfo|None
@@ -195,20 +193,6 @@ class ModbusTCPConnection:
         ])
         return self._frame(pdu)
 
-    def _build_write_frame(self, register_address: int, value: int) -> bytes:
-        """Construye la trama de escritura de un registro (función 0x06)."""
-        pdu = bytes([
-            FUNCTION_WRITE_SINGLE,
-            (register_address >> 8) & 0xFF,
-            register_address & 0xFF,
-            (value >> 8) & 0xFF,
-            value & 0xFF,
-        ])
-        return self._frame(pdu)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Lectura de registros
-    # ─────────────────────────────────────────────────────────────────────────
 
     def read_holding_registers(self, start_address: int, count: int) -> Optional[list]:
         """
@@ -303,13 +287,7 @@ class ModbusTCPConnection:
         """Longitud total de la trama de lectura esperada."""
         return self._expected_read_bytes(count)
 
-    def _find_frame(
-        self,
-        buffer: bytes,
-        expected_count: int,
-        function: int = FUNCTION_READ_HOLDING,
-        total: Optional[int] = None,
-    ) -> Optional[tuple]:
+    def _find_frame(self, buffer: bytes, expected_count: int) -> Optional[tuple]:
         """
         Busca una trama Modbus válida dentro de `buffer`.
 
@@ -319,9 +297,7 @@ class ModbusTCPConnection:
         if len(buffer) < 5:
             return None
 
-        if total is None:
-            total = 5 + (expected_count * 2) if function == FUNCTION_READ_HOLDING \
-                else (12 if self.framing == "mbap" else 8)
+        total = self._frame_length(expected_count)
 
         if self.framing == "mbap":
             for i in range(0, len(buffer) - 8):
@@ -334,15 +310,14 @@ class ModbusTCPConnection:
                     if len(buffer) >= i + 9:
                         return (i, 9)
                     continue
-                if func != function:
+                if func != FUNCTION_READ_HOLDING:
                     continue
-                if function == FUNCTION_READ_HOLDING:
-                    if len(buffer) < i + 9:
-                        return None
-                    byte_count = buffer[i + 8]
-                    if byte_count != expected_count * 2:
-                        continue
-                    total = 9 + byte_count
+                if len(buffer) < i + 9:
+                    return None
+                byte_count = buffer[i + 8]
+                if byte_count != expected_count * 2:
+                    continue
+                total = 9 + byte_count
                 if len(buffer) < i + total:
                     return None
                 return (i, total)
@@ -359,13 +334,12 @@ class ModbusTCPConnection:
                 if len(buffer) >= i + 5 and verify_crc(bytes(buffer[i:i + 5])):
                     return (i, 5)
                 continue
-            if func != function:
+            if func != FUNCTION_READ_HOLDING:
                 continue
-            if function == FUNCTION_READ_HOLDING:
-                byte_count = buffer[i + 2]
-                if byte_count != expected_count * 2:
-                    continue
-                total = 5 + (expected_count * 2)
+            byte_count = buffer[i + 2]
+            if byte_count != expected_count * 2:
+                continue
+            total = 5 + (expected_count * 2)
             if len(buffer) < i + total:
                 return None
             if verify_crc(bytes(buffer[i:i + total])):
@@ -454,119 +428,7 @@ class ModbusTCPConnection:
     # Escritura de registro
     # ─────────────────────────────────────────────────────────────────────────
 
-    def write_single_register(self, register_address: int, value: int) -> WriteResult:
-        """
-        Escribe un solo registro via TCP.
-        Función 0x06 del protocolo Modbus.
 
-        Returns: WriteResult con éxito o error
-        """
-        if not self.is_open:
-            return WriteResult(False, register_address, value, 0.0, "No conectado")
-
-        if self.map is not None and self.map.settings_start is None:
-            logger.warning(
-                "mapa sin bloque de ajustes: no se puede escribir en %s",
-                self.map.label,
-            )
-            return WriteResult(
-                False, register_address, value, 0.0,
-                "mapa sin bloque de ajustes",
-            )
-
-        start_time = time.perf_counter()
-
-        try:
-            self._drain()
-            frame = self._build_write_frame(register_address, value)
-            self._socket.sendall(bytes(frame))
-
-            response = self._read_write_response()
-
-            latency = (time.perf_counter() - start_time) * 1000
-
-            if response is None or len(response) < 5:
-                return WriteResult(
-                    False, register_address, value, latency,
-                    "Sin respuesta del gateway"
-                )
-
-            if self.framing == "mbap":
-                if response[6] != self.slave_id:
-                    return WriteResult(
-                        False, register_address, value, latency,
-                        "Slave ID no coincide"
-                    )
-                if response[7] == FUNCTION_WRITE_SINGLE:
-                    return WriteResult(True, register_address, value, latency)
-                if response[7] & 0x80:
-                    return WriteResult(
-                        False, register_address, value, latency,
-                        f"Excepción Modbus: código {response[9]}"
-                    )
-                return WriteResult(
-                    False, register_address, value, latency,
-                    "Respuesta inesperada"
-                )
-
-            if not verify_crc(response):
-                return WriteResult(
-                    False, register_address, value, latency,
-                    "CRC inválido"
-                )
-            if response[0] != self.slave_id:
-                return WriteResult(
-                    False, register_address, value, latency,
-                    "Slave ID no coincide"
-                )
-            if response[1] == FUNCTION_WRITE_SINGLE:
-                return WriteResult(True, register_address, value, latency)
-            if response[1] & 0x80:
-                return WriteResult(
-                    False, register_address, value, latency,
-                    f"Excepción Modbus: código {response[2]}"
-                )
-            return WriteResult(
-                False, register_address, value, latency,
-                "Respuesta inesperada"
-            )
-
-        except (socket.timeout, OSError) as e:
-            latency = (time.perf_counter() - start_time) * 1000
-            return WriteResult(False, register_address, value, latency, str(e))
-
-    def _read_write_response(self) -> Optional[bytes]:
-        """
-        Lee la respuesta a una escritura (función 0x06) tolerando ruido
-        previo del gateway (banner ASCII).
-        """
-        if not self._socket:
-            return None
-
-        buffer = bytearray()
-        start_time = time.perf_counter()
-
-        while True:
-            elapsed_ms = (time.perf_counter() - start_time) * 1000
-            if elapsed_ms > READ_TIMEOUT_MS:
-                return None
-
-            found = self._find_frame(
-                bytes(buffer), 0, function=FUNCTION_WRITE_SINGLE
-            )
-            if found is not None:
-                offset, total = found
-                return bytes(buffer[offset:offset + total])
-
-            try:
-                chunk = self._socket.recv(self.RECV_BUFFER_SIZE)
-                if not chunk:
-                    return None
-                buffer.extend(chunk)
-            except socket.timeout:
-                return None
-            except OSError:
-                return None
 
     def _recv_exact(self, num_bytes: int) -> Optional[bytes]:
         """Lee exactamente num_bytes del socket o None si falla."""
@@ -834,34 +696,11 @@ class ModbusTCPConnection:
     # Métodos de escritura — misma interfaz que ModbusConnection RTU
     # ─────────────────────────────────────────────────────────────────────────
 
-    def set_float_voltage(self, voltage: float) -> WriteResult:
-        value = int(voltage * 10)
-        return self.write_single_register(0x2123, value)
 
-    def set_absorb_voltage(self, voltage: float) -> WriteResult:
-        value = int(voltage * 10)
-        return self.write_single_register(0x2122, value)
 
-    def set_cutoff_voltage(self, voltage: float) -> WriteResult:
-        value = int(voltage * 10)
-        return self.write_single_register(0x211F, value)
 
-    def set_recharge_voltage(self, voltage: float) -> WriteResult:
-        value = int(voltage * 10)
-        return self.write_single_register(0x2156, value)
 
-    def set_back_to_battery_voltage(self, voltage: float) -> WriteResult:
-        value = int(voltage * 10)
-        return self.write_single_register(0x2159, value)
 
-    def set_output_priority(self, priority) -> WriteResult:
-        return self.write_single_register(0x212A, priority.value)
 
-    def set_charge_priority(self, priority) -> WriteResult:
-        return self.write_single_register(0x212C, priority.value)
 
-    def set_max_charge_current(self, current: int) -> WriteResult:
-        return self.write_single_register(0x212E, current)
 
-    def set_max_ac_charge_current(self, current: int) -> WriteResult:
-        return self.write_single_register(0x2130, current)

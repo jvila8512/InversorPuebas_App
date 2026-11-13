@@ -29,7 +29,6 @@ import serial.tools.list_ports
 
 SLAVE_ADDRESS = 0x01
 FUNCTION_READ = 0x03
-FUNCTION_WRITE = 0x06
 READ_TIMEOUT_MS = 1000
 
 
@@ -73,7 +72,6 @@ class ScanResult:
     baudrate: int
     total_scanned: int
     registers_found: list
-    writable_test: list
 
 
 class ModbusConnection:
@@ -165,40 +163,6 @@ class ModbusConnection:
         except serial.SerialException:
             return None
 
-    def write_single_register(self, address: int, value: int) -> tuple[bool, str]:
-        """Escribe un registro (para probar si es escribible)."""
-        if not self.is_open:
-            return False, "No conectado"
-
-        try:
-            frame = bytearray([
-                SLAVE_ADDRESS,
-                FUNCTION_WRITE,
-                (address >> 8) & 0xFF,
-                address & 0xFF,
-                (value >> 8) & 0xFF,
-                value & 0xFF,
-            ])
-            crc = calculate_crc(bytes(frame))
-            frame.extend(crc)
-
-            self._serial.reset_input_buffer()
-            self._serial.write(frame)
-            time.sleep(0.2)
-
-            # Leer respuesta
-            response = self._serial.read(8)
-            if len(response) >= 5 and response[0] == SLAVE_ADDRESS and response[1] == FUNCTION_WRITE:
-                return True, "OK"
-            return False, f"Respuesta inesperada: {response.hex()}"
-
-        except serial.SerialException as e:
-            return False, str(e)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CLASIFICADOR DE VALORES
-# ══════════════════════════════════════════════════════════════════════════════
 
 def classify_value(value: int, address: int) -> tuple[str, str, str]:
     """
@@ -316,71 +280,9 @@ def full_scan(conn: ModbusConnection) -> dict:
     return results
 
 
-def test_writable_registers(conn: ModbusConnection, registers: list) -> list:
-    """
-    Prueba si ciertos registros son escribibles.
-    ATENCIÓN: Esto prueba escritura con valores seguros (0x0000 y 0xFFFF).
-    """
-    print("\n" + "=" * 70)
-    print("PROBANDO REGISTROS ESCRIBIBLES")
-    print("=" * 70)
-    print("⚠️  ADVERTENCIA: Esta prueba escribe valores temporales en el inversor")
-    print("   Se usan valores seguros (0x0000 y 0xFFFF) para no dañar configuración\n")
-
-    writable = []
-    non_writable = []
-
-    # Solo probar registros de configuración conocidos
-    test_addresses = [
-        0x211F,  # Cut-off voltage
-        0x2122,  # CV voltage
-        0x2123,  # Float voltage
-        0x212A,  # Output priority
-        0x212C,  # Charge priority
-        0x212E,  # Max charge current
-        0x2130,  # Max AC charge current
-        0x2156,  # Back to grid voltage
-        0x2159,  # Back to battery voltage
-    ]
-
-    for addr in test_addresses:
-        print(f"   Probando 0x{addr:04X}...", end=" ")
-
-        # Primero leer valor actual
-        regs = conn.read_holding_registers(addr, 1)
-        if regs is None:
-            print("❌ Sin respuesta")
-            non_writable.append({'address': addr, 'error': 'Sin respuesta'})
-            continue
-
-        original_value = regs[0]
-
-        # Probar escribiendo 0xFFFF (si es seguro)
-        success, msg = conn.write_single_register(addr, 0xFFFF)
-
-        if success:
-            print(f"✅ ESCRIBIBLE (valor actual: {original_value})")
-            writable.append({
-                'address': addr,
-                'original_value': original_value,
-                'test_value': 0xFFFF
-            })
-        else:
-            print(f"❌ No escribible ({msg})")
-            non_writable.append({
-                'address': addr,
-                'original_value': original_value,
-                'error': msg
-            })
-
-        time.sleep(0.3)
-
-    print(f"\n📊 Resumen: {len(writable)} escribibles, {len(non_writable)} no escribibles")
-
-    return {'writable': writable, 'non_writable': non_writable}
 
 
-def save_results(results: dict, writable_test: dict, port: str, baudrate: int):
+def save_results(results: dict, port: str, baudrate: int):
     """Guarda los resultados en un archivo."""
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     filename = f"scanner_results_{timestamp}.txt"
@@ -409,14 +311,9 @@ def save_results(results: dict, writable_test: dict, port: str, baudrate: int):
                             f"{reg['classification']:<15} {reg['possible_real_value']:<12} {reg['notes']}\n")
 
         f.write("\n" + "=" * 70 + "\n")
-        f.write("REGISTROS ESCRIBIBLES\n")
         f.write("=" * 70 + "\n\n")
-
-        f.write("### ESCRIBIBLES ###\n")
         for w in writable_test.get('writable', []):
             f.write(f"  0x{w['address']:04X} - Valor original: {w['original_value']}\n")
-
-        f.write("\n### NO ESCRIBIBLES ###\n")
         for nw in writable_test.get('non_writable', []):
             f.write(f"  0x{nw['address']:04X} - Error: {nw.get('error', 'N/A')}\n")
 
@@ -529,16 +426,8 @@ def main():
     # Ejecutar escaneo completo
     results = full_scan(conn)
 
-    # Probar escritura (opcional)
-    print("\n")
-    response = input("¿Desea probar si los registros son escribibles? (s/n): ").strip().lower()
-    writable_test = {'writable': [], 'non_writable': []}
-
-    if response == 's':
-        writable_test = test_writable_registers(conn, [])
-
     # Guardar y resumir
-    filename = save_results(results, writable_test, port, baudrate)
+    filename = save_results(results, port, baudrate)
     print_summary(results)
 
     print(f"\n📁 Archivo de resultados: {filename}")

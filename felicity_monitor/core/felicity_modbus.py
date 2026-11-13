@@ -43,7 +43,6 @@ logger = logging.getLogger(__name__)
 
 SLAVE_ADDRESS = 0x01
 FUNCTION_READ_HOLDING = 0x03
-FUNCTION_WRITE_SINGLE = 0x06
 FUNCTION_READ_INPUT = 0x04
 
 # Registros de estado (0x1101 - 0x112A)
@@ -660,73 +659,6 @@ class ModbusConnection:
     # Escritura de registro
     # ─────────────────────────────────────────────────────────────────────────
 
-    def write_single_register(self, register_address: int, value: int) -> WriteResult:
-        """
-        Escribe un solo registro en el inversor.
-        Función 0x06 del protocolo Modbus.
-        
-        Returns: WriteResult con éxito o error
-        """
-        if not self.is_open:
-            return WriteResult(False, register_address, value, 0.0, "No conectado")
-
-        if self.map is not None and self.map.settings_start is None:
-            logger.warning(
-                "mapa sin bloque de ajustes: no se puede escribir en %s",
-                self.map.label,
-            )
-            return WriteResult(
-                False, register_address, value, 0.0,
-                "mapa sin bloque de ajustes",
-            )
-
-        start_time = time.perf_counter()
-
-        try:
-            # Construir trama:
-            # [Slave][Func][Address Hi][Address Lo][Value Hi][Value Lo][CRC]
-            frame = bytearray([
-                self.slave_id,
-                FUNCTION_WRITE_SINGLE,
-                (register_address >> 8) & 0xFF,
-                register_address & 0xFF,
-                (value >> 8) & 0xFF,
-                value & 0xFF,
-            ])
-            crc = calculate_crc(bytes(frame))
-            frame.extend(crc)
-
-            # Enviar
-            self._serial.reset_input_buffer()
-            self._serial.write(frame)
-
-            # Leer respuesta (8 bytes)
-            response = self._read_response(1)
-
-            latency = (time.perf_counter() - start_time) * 1000
-
-            if response is None or len(response) < 5:
-                return WriteResult(False, register_address, value, latency, 
-                                 "Sin respuesta del inversor")
-
-            # Verificar que sea echo del request
-            if response[0] == self.slave_id and response[1] == FUNCTION_WRITE_SINGLE:
-                return WriteResult(True, register_address, value, latency)
-
-            # Verificar exception
-            if response[1] & 0x80:
-                return WriteResult(False, register_address, value, latency,
-                                 f"Excepción Modbus: código {response[2]}")
-
-            return WriteResult(False, register_address, value, latency, 
-                             "Respuesta inesperada")
-
-        except serial.SerialException as e:
-            return WriteResult(False, register_address, value, 0.0, str(e))
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Operaciones de alto nivel - Estado
-    # ─────────────────────────────────────────────────────────────────────────
 
     def _read_status_registers(self, map_obj: RegisterMap) -> Optional[list]:
         """Lee el bloque de estado completo, partiéndolo en bloques <= 60."""
@@ -968,50 +900,14 @@ class ModbusConnection:
     # Escritura de configuraciones
     # ─────────────────────────────────────────────────────────────────────────
 
-    def set_float_voltage(self, voltage: float) -> WriteResult:
-        """Establece voltaje de flotación (registro 0x2123)."""
-        value = int(voltage * 10)
-        return self.write_single_register(0x2123, value)
 
-    def set_absorb_voltage(self, voltage: float) -> WriteResult:
-        """Establece voltaje de absorción (registro 0x2122)."""
-        value = int(voltage * 10)
-        return self.write_single_register(0x2122, value)
 
-    def set_cutoff_voltage(self, voltage: float) -> WriteResult:
-        """Establece voltaje de corte (registro 0x211F)."""
-        value = int(voltage * 10)
-        return self.write_single_register(0x211F, value)
 
-    def set_recharge_voltage(self, voltage: float) -> WriteResult:
-        """Establece voltaje de recarga (registro 0x2156)."""
-        value = int(voltage * 10)
-        return self.write_single_register(0x2156, value)
 
-    def set_back_to_battery_voltage(self, voltage: float) -> WriteResult:
-        """Establece voltaje de regreso a batería (registro 0x2159)."""
-        value = int(voltage * 10)
-        return self.write_single_register(0x2159, value)
 
-    def set_output_priority(self, priority: OutputPriority) -> WriteResult:
-        """Establece prioridad de salida (registro 0x212A)."""
-        return self.write_single_register(0x212A, priority.value)
 
-    def set_charge_priority(self, priority: ChargePriority) -> WriteResult:
-        """Establece prioridad de carga (registro 0x212C)."""
-        return self.write_single_register(0x212C, priority.value)
 
-    def set_max_charge_current(self, current: int) -> WriteResult:
-        """Establece corriente máxima de carga (registro 0x212E)."""
-        return self.write_single_register(0x212E, current)
 
-    def set_max_ac_charge_current(self, current: int) -> WriteResult:
-        """Establece corriente máxima de carga AC (registro 0x2130)."""
-        return self.write_single_register(0x2130, current)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Utilidades
-    # ─────────────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _signed_value(value: int) -> int:
