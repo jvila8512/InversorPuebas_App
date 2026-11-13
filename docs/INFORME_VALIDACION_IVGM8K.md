@@ -21,7 +21,31 @@ conectara y mostrara los datos bien. Los tres están corregidos y cubiertos por 
 | 2 | El gateway envía un **banner ASCII** al conectar | La primera lectura de cada sesión llegaba corrupta | ✅ Corregido |
 | 3 | El firmware marca registros no disponibles con **0xFFFE / 0xFFFF** | La app mostraba `-2` y `65534` como si fueran datos | ✅ Corregido |
 | 4 | El mapa IVGM-8K solo cubría 19 de 477 direcciones documentadas | Faltaban 4 temperaturas, tensión AC, frecuencias y % de carga | ✅ Corregido |
-| 5 | El bloque de configuración de paralelo (0x2140-0x2143) no era accesible | Imposible preparar 3 inversores en paralelo | ✅ Corregido |
+| 5 | El bloque de configuración de paralelo (0x2140-0x2143) no era accesible | Imposible diagnosticar una instalación en paralelo | ✅ Corregido |
+| 6 | La app podía **escribir** en el inversor (0x06 y comandos ASCII) | Riesgo de alterar la EEPROM del equipo con un clic | ✅ **Eliminado** |
+
+---
+
+## 1.1 Modo de operación: SOLO LECTURA
+
+La app quedó como un **monitor de solo lectura**. Eliminado:
+
+- La función Modbus **0x06 (Write Single Register)** y sus 9 métodos derivados
+  (`set_float_voltage`, `set_absorb_voltage`, `set_cutoff_voltage`, `set_recharge_voltage`,
+  `set_back_to_battery_voltage`, `set_output_priority`, `set_charge_priority`,
+  `set_max_charge_current`, `set_max_ac_charge_current`).
+- La pestaña **"Control (9 params)"** completa, que solo servía para escribir en la EEPROM.
+- El panel **"Asignar Modbus ID"**, que escribía `0x2142` en el equipo.
+- La sonda del scanner que escribía `0xFFFF` en 9 registros de configuración.
+- Los módulos `core/write_commands.py` y `core/tab_control.py` (código muerto, solo de escritura).
+
+**El único código de función que la app puede enviar es `0x03` (Read Holding Registers).**
+
+El paralelismo se resuelve **sin escribir**: la app cambia el `slave_id` de cada petición y lee a
+cada inversor por separado. Para descubrir qué IDs hay en el bus, el botón **"Detectar en el
+bus"** sondea las direcciones 1-16 con lecturas FC03 y llena la tabla automáticamente.
+
+El ID Modbus de cada equipo se configura en el **display del inversor**, no desde la app.
 
 ---
 
@@ -211,8 +235,31 @@ python test_8k_real.py
 | Archivo | Cambio |
 |---------|--------|
 | `core/register_maps.py` | Mapa IVGM-8K de 19 → 38 campos. Nuevo `settings_fields` para 0x2140-0x2143. `is_not_available()` ignora 0xFFFE/0xFFFF. Alias canónicos para el mapa IVGM. `decode_settings_fields()` nuevo. |
-| `core/modbus_tcp.py` | Framing por defecto **RTU** + modo **auto**. `_drain()`, `_find_frame()` y `_read_write_response()`: el banner del gateway ya no rompe la lectura. `read_settings()` consciente del mapa. |
-| `core/felicity_modbus.py` | `ModbusStatus` con los campos del IVGM-8K. `ModbusSettings` con `parallel_count`, `parallel_address`, `modbus_id`, `rated_power` y `parallel_role_str`. `read_settings()` consciente del mapa. |
-| `core/multi_inverter.py` | `InverterData` con `pv1_voltage`, `inverter_temp`, `ambient_temp`, `battery_temp`. |
-| `main.py` | Combo de framing con RTU por defecto y opción "Auto". **Nuevo grupo "Configuración de paralelo (IVGM-8K)"** para leer 0x2140-0x2143 y asignar el Modbus ID. Tabla del paralelo con columnas SOC, PV1, P.PV, T.Inv y T.Amb. |
+| `core/modbus_tcp.py` | Framing por defecto **RTU** + modo **auto**. `_drain()`, `_find_frame()` y `_read_write_response()`: el banner del gateway ya no rompe la lectura. `read_settings()` consciente del mapa. **Eliminada toda la capacidad de escritura.** |
+| `core/felicity_modbus.py` | `ModbusStatus` con los campos del IVGM-8K. `ModbusSettings` con `parallel_count`, `parallel_address`, `modbus_id`, `rated_power` y `parallel_role_str`. `read_settings()` consciente del mapa. **Eliminada toda la capacidad de escritura.** |
+| `core/multi_inverter.py` | `InverterData` con `pv1_voltage`, `inverter_temp`, `ambient_temp`, `battery_temp`. Nueva función `scan_slave_ids()` que detecta los IDs del bus con solo lecturas. |
+| `core/modbus_scanner.py` | Eliminada la sonda que escribía `0xFFFF` en registros de configuración. |
+| `main.py` | Combo de framing con RTU por defecto y opción "Auto". Grupo **"Diagnóstico de paralelo — SOLO LECTURA"**. Botón **"Detectar en el bus"**. Tabla del paralelo con columnas SOC, PV1, P.PV, T.Inv y T.Amb. **Eliminada la pestaña Control y todo control de escritura.** |
 | `core/profiles.py` | Perfil IVGM-8K con nota de "validado contra hardware real". |
+| `core/write_commands.py`, `core/tab_control.py` | **Eliminados** (código muerto, solo de escritura). |
+
+---
+
+## 7. Verificación de que la app no escribe
+
+El test `test_solo_lectura.py` es la garantía, y corre como parte de la suite:
+
+| Comprobación | Resultado |
+|--------------|-----------|
+| Ningún método `write_*` / `set_*` de escritura en la app | ✅ |
+| Ninguna referencia a la función Modbus 0x06 | ✅ |
+| `ModbusTCPConnection` y `ModbusConnection` sin métodos de escritura | ✅ |
+| La UI no expone ningún control de escritura | ✅ |
+| El scanner no escribe (ni para sondear) | ✅ |
+| La trama que la app construye es FC03 | ✅ |
+| El paralelo cambia el `slave_id` por su cuenta y lo restaura | ✅ |
+
+Y el test `test_scan_slaves.py` lo verifica **en runtime**, contra un bus RS485 simulado con tres
+inversores: detecta los slaves 1, 2 y 3, consulta a cada uno, restaura el `slave_id` original, y
+**las 42 tramas enviadas son todas FC03 — ninguna de escritura**.
+
