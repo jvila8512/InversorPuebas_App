@@ -2236,6 +2236,7 @@ class MainWindow(QMainWindow):
         self.tab_profiles = TabProfiles(self._profile_manager)
         # Si se agregan/borran/editan perfiles, la tabla multi-inversor se actualiza
         self.tab_profiles.profile_changed.connect(self.tab_conn.refresh_profile_choices)
+        self.tab_profiles.profile_changed.connect(self._on_profile_changed)
         self.tab_profiles.profiles_changed.connect(self.tab_conn.refresh_profile_choices)
         self.tab_api = TabAPI()
 
@@ -2316,6 +2317,16 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"{'✅ Conectado' if ok else '❌ Error'}: {msg}")
 
             if ok:
+                # Aplicar el mapa de registros del perfil activo. Sin esto
+                # la conexión se queda con el mapa clásico y el monitor
+                # interpreta mal un IVGM-8K (el layout no coincide).
+                mapa = self._active_map_name()
+                self._conn.set_map(mapa)
+                etiqueta_mapa = self._active_map_label(mapa)
+                self.tab_conn.log(
+                    f"📐 Mapa de registros: {etiqueta_mapa}", '#9b59b6'
+                )
+
                 # Leer config multi-inversor
                 self._multi_config = self.tab_conn.get_multi_config()
                 self.tab_conn.log("Iniciando monitoreo en tiempo real...", '#3498db')
@@ -2433,10 +2444,10 @@ class MainWindow(QMainWindow):
     def _read_settings(self):
         if not self._conn or not self._conn.is_open:
             return
-        # Usar el mapa del primer inversor configurado (si hay multi-inversor)
-        map_name = None
-        if self._multi_config and self._multi_config.entries:
-            map_name = self._multi_config.entries[0].map_name
+        # El mapa es el del perfil activo, NO el del primer inversor de
+        # la tabla del paralelo: el monitor y los ajustes deben usar el
+        # mismo mapa, y la tabla puede tener otro mixto.
+        map_name = self._active_map_name()
         settings = self._conn.read_settings(map=map_name)
         if settings:
             self.tab_settings.update_settings(settings)
@@ -2451,6 +2462,38 @@ class MainWindow(QMainWindow):
     def _on_interval_changed(self, seconds: float):
         if self._monitor:
             self._monitor.interval = seconds
+
+    def _active_map_name(self) -> str:
+        """Nombre del mapa de registros del perfil activo."""
+        try:
+            perfil = self._profile_manager.active
+            return getattr(perfil, "register_map", "classic") or "classic"
+        except Exception:
+            return "classic"
+
+    def _active_map_label(self, mapa_name: str = None) -> str:
+        """Descripción legible del mapa activo, para el log."""
+        from core.register_maps import get_map
+        nombre = mapa_name or self._active_map_name()
+        try:
+            mapa = get_map(nombre)
+            return f"{mapa.label}"
+        except Exception:
+            return nombre
+
+    def _on_profile_changed(self, perfil):
+        """
+        Cambió el perfil activo: refrescar los combos de la tabla del
+        paralelo y, si hay conexión, aplicar el mapa nuevo. Sin esto la
+        app seguiría interpretando los datos con el mapa anterior.
+        """
+        if self._conn is not None and getattr(self._conn, "is_open", False):
+            mapa = self._active_map_name()
+            self._conn.set_map(mapa)
+            self.tab_conn.log(
+                f"📐 Mapa de registros actualizado: {self._active_map_label(mapa)}",
+                '#9b59b6',
+            )
 
     # ── Handlers para Multi-Inversor ──
 

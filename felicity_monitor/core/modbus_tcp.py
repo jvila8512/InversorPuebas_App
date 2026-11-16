@@ -481,9 +481,11 @@ class ModbusTCPConnection:
         Lee el estado actual del inversor via TCP.
         Decodifica según el mapa indicado (por defecto, el mapa activo).
         """
+        # El mapa solo decide como se decodifica: una lectura NUNCA
+        # cambia el mapa activo de la conexion. Si lo hiciera, el
+        # paralelo dejaria el mapa del ultimo inversor pollado y
+        # pisaria el del perfil activo.
         map_obj = get_map(map) if map is not None else (self.map or CLASSIC_MAP)
-        if map is not None:
-            self.map = map_obj
 
         regs = self._read_status_registers(map_obj)
         if regs is None:
@@ -562,9 +564,11 @@ class ModbusTCPConnection:
         Lee la configuración del inversor via TCP.
         Si el mapa no tiene bloque de ajustes, devuelve None con advertencia.
         """
+        # El mapa solo decide como se decodifica: una lectura NUNCA
+        # cambia el mapa activo de la conexion. Si lo hiciera, el
+        # paralelo dejaria el mapa del ultimo inversor pollado y
+        # pisaria el del perfil activo.
         map_obj = get_map(map) if map is not None else (self.map or CLASSIC_MAP)
-        if map is not None:
-            self.map = map_obj
 
         if map_obj.settings_start is None or map_obj.settings_count <= 0:
             logger.warning("mapa sin bloque de ajustes: %s", map_obj.label)
@@ -655,9 +659,11 @@ class ModbusTCPConnection:
         Lee la información del equipo via TCP.
         Si el mapa no tiene bloque de información, devuelve None.
         """
+        # El mapa solo decide como se decodifica: una lectura NUNCA
+        # cambia el mapa activo de la conexion. Si lo hiciera, el
+        # paralelo dejaria el mapa del ultimo inversor pollado y
+        # pisaria el del perfil activo.
         map_obj = get_map(map) if map is not None else (self.map or CLASSIC_MAP)
-        if map is not None:
-            self.map = map_obj
 
         if map_obj.info_start is None or map_obj.info_count <= 0:
             logger.warning("mapa sin bloque de información: %s", map_obj.label)
