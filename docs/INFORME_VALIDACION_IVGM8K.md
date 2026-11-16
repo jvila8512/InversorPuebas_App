@@ -23,6 +23,51 @@ conectara y mostrara los datos bien. Los tres están corregidos y cubiertos por 
 | 4 | El mapa IVGM-8K solo cubría 19 de 477 direcciones documentadas | Faltaban 4 temperaturas, tensión AC, frecuencias y % de carga | ✅ Corregido |
 | 5 | El bloque de configuración de paralelo (0x2140-0x2143) no era accesible | Imposible diagnosticar una instalación en paralelo | ✅ Corregido |
 | 6 | La app podía **escribir** en el inversor (0x06 y comandos ASCII) | Riesgo de alterar la EEPROM del equipo con un clic | ✅ **Eliminado** |
+| 7 | La conexión usaba **siempre el mapa clásico**, nunca el del perfil | El monitor del 8K mostraba basura | ✅ Corregido |
+
+---
+
+## 1.2 El bug del mapa: por qué el monitor mostraba basura
+
+Este se encontró **al integrar el hardware real**, y es el más importante de todos.
+
+`_on_connect()` creaba la conexión pero **nunca le aplicaba el mapa de registros**. La conexión
+nacía con `CLASSIC_MAP` y se quedaba ahí para siempre. Resultado: el monitor leía los registros
+del 8K y los interpretaba con el layout del Voltronic clásico.
+
+Con los datos reales de tu equipo, la diferencia es brutal:
+
+| Valor | Con el mapa **clásico** (bug) | Con el mapa **IVGM-8K** (correcto) |
+|-------|------------------------------|-----------------------------------|
+| Tensión de batería | **0.00 V** | **53.5 V** |
+| SOC | **0 %** | **49 %** |
+| Tensión de salida | **52.8 V** | **244.9 V** |
+| Frecuencia de red | **3.73 Hz** | **60.02 Hz** |
+| Tensión PV | **0.00 V** | **300.9 V** |
+| Potencia PV | **0 W** | **1928 W** |
+| Temperatura del inversor | **0 °C** | **24 °C** |
+
+Es exactamente la "basura" que mostraba la comparación de mapas de `paso1.txt`.
+
+Había **dos causas** y ambas hacía falta arreglar:
+
+1. **`_on_connect()` no llamaba a `set_map()`.** Ahora aplica el mapa del **perfil activo** y lo
+   deja escrito en el log (`📐 Mapa de registros: ...`). Si cambiás de perfil con la app conectada,
+   el mapa se actualiza al instante.
+2. **Las lecturas mutaban el mapa de la conexión.** `read_status(map=...)` y
+   `read_settings(map=...)` asignaban `self.map = map_obj`. Eso rompía dos cosas:
+   - En paralelo, cada inversor pollado **sobrescribía** el mapa de la conexión compartida.
+   - `_read_settings()` usaba el mapa de la **primera fila de la tabla del paralelo**, que por
+     defecto es "classic", y pisaba el mapa del perfil activo.
+
+   Ahora las lecturas **no tienen efectos secundarios**: el mapa solo decide cómo se decodifica.
+
+El perfil **Felicity IVGM-8K** quedó como perfil activo por defecto, así que al conectar se usa
+el mapa correcto sin ningún paso manual.
+
+**Cobertura:** `test_mapa_al_conectar.py` levanta la app completa contra un gateway simulado que
+sirve los registros reales del CSV, y verifica que la batería da 53.5 V, el SOC 49 %, la salida
+244.9 V, la frecuencia 60.02 Hz, PV 300.9 V / 1928 W y la temperatura 24 °C.
 
 ---
 
@@ -193,6 +238,70 @@ produce basura silenciosa: por eso la app obliga a elegir el mapa por perfil y l
 | 0xF801 | Device SubTypeID | 1039 |
 | 0xF803 | Communication Protocol InformationID | 51224 |
 | 0xF804 | Machine Serial Number SNID | 1203 |
+
+---
+
+## 3.4 Cómo lee la app y cada cuánto
+
+### Ciclo de lectura (un inversor)
+
+```
+[Monitor thread]  ── espera el intervalo ──┐
+        │                                   │
+        ▼                                   │
+  read_status()  ──► 3 peticiones FC03      │
+        │            0x1100 x 130           │
+        │            (bloques de 60)        │
+        ▼                                   │
+  actualiza la UI                           │
+        └───────────────────────────────────┘
+```
+
+| Parámetro | Valor | Dónde se cambia |
+|-----------|-------|-----------------|
+| **Intervalo de polling** | **3 s** (por defecto) | Monitor → slider "Intervalo polling", rango 1-30 s |
+| Peticiones por ciclo (8K) | **3** (0x1100 x 130 en bloques de ≤60) | fijo por el mapa |
+| Peticiones por ciclo (5K clásico) | **1** (0x1100 x 43) | fijo por el mapa |
+| Timeout por petición | 1000 ms | `READ_TIMEOUT_MS` |
+| Reintentos por petición | 3 | `MAX_RETRIES` |
+| Lectura de ajustes | +1 petición, **cada 10 ciclos** | fijo |
+| Lectura de info del equipo | +1 petición, **cada 30 ciclos** | fijo |
+
+El bloque de telemetría del 8K son 130 registros, así que se parte en **3 peticiones de ≤60**
+(el máximo que acepta el bus sin problemas). Todo en bloques contiguos: el mapa pide
+`0x1100` una vez y la app rellena los 130 registros solo.
+
+### Ciclo de lectura (paralelo)
+
+```
+[Multi thread]
+   │
+   ├─ slave 1  ──►  read_status(map=ivgm_8k)   ← conn.slave_id = 1
+   ├─ slave 2  ──►  read_status(map=ivgm_8k)   ← conn.slave_id = 2
+   └─ slave 3  ──►  read_status(map=ivgm_8k)   ← conn.slave_id = 3
+   │
+   └─ espera el intervalo (5 s por defecto) ──► repite
+```
+
+| Parámetro | Valor |
+|-----------|-------|
+| **Intervalo de polling** | **5 s** (por defecto) |
+| Peticiones por ciclo | 3 por inversor (9 con 3 inversores) |
+| Timeout por ID | 800 ms (configurable) |
+| Inversores marcados Offline | tras 3 timeouts seguidos |
+
+Ojo con un detalle: el intervalo es **entre ciclos completos**, no entre inversores. Con 3
+inversores, el tiempo real entre dos lecturas del mismo inversor es el intervalo **más** el tiempo
+del ciclo. A 9600 baud cada bloque de 60 registros tarda ~130 ms, así que un ciclo de 3 inversores
+ocupa el bus entre 1 y 2 segundos.
+
+### Los registros que se piden
+
+| Mapa | Bloque de estado | Ajustes | Info |
+|------|------------------|---------|------|
+| `classic` | 0x1100 x 43 | 0x211F x 59 | 0xF800 x 13 |
+| `ivgm_8k` | 0x1100 x 130 | 0x2140 x 4 | 0xF800 x 14 |
+| `must` | 0x6271 x 35 | — | — |
 
 ---
 
