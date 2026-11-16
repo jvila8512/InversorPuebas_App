@@ -142,5 +142,5 @@
       "notes": "Mapa 'Bloque D' de MUST. SIN VALIDAR contra hardware: verificar con verificar_rs485.py antes de confiar en los valores."
     }
   ],
-  "active_index": 0
+  "active_index": 5
 }
